@@ -437,8 +437,9 @@ class Window(QMainWindow):
         self.auto_subs = checkbox("Uwzględniaj automatyczne", options.auto_subtitles)
         self.embed_subs = checkbox("Osadzaj w filmie", options.embed_subtitles)
         self.sub_lang = QLineEdit(options.subtitle_languages)
-        self.metadata = checkbox("Metadane w plikach i tagach", options.metadata)
-        self.thumbnail = checkbox("Zapisuj miniatury", options.thumbnail)
+        self.metadata = checkbox("Osadzaj metadane", options.metadata)
+        self.thumbnail = checkbox("Osadzaj miniaturę", options.thumbnail)
+        self.keep_sidecars = checkbox("Zachowuj osobne pliki z miniaturą i metadanymi", options.keep_sidecars)
         self.force = checkbox("Pobieraj ponownie filmy z historii", options.force)
         folder_row = row(self.folder, button("Przeglądaj…", self.choose_folder))
         folder_row.layout().setStretch(0, 1)
@@ -449,7 +450,9 @@ class Window(QMainWindow):
         form.addRow("Preferowany język audio", self.audio_lang)
         form.addRow("Napisy", row(self.subs, self.auto_subs, self.embed_subs, None))
         form.addRow("Języki napisów, oddzielone przecinkiem", self.sub_lang)
-        form.addRow(row(self.metadata, self.thumbnail, self.force, None))
+        form.addRow(row(self.metadata, self.thumbnail, None))
+        form.addRow(row(self.keep_sidecars, None))
+        form.addRow(row(self.force, None))
         layout.addWidget(media)
         behavior = QGroupBox("Aplikacja i logowanie")
         form = QFormLayout(behavior)
@@ -679,6 +682,7 @@ class Window(QMainWindow):
             subtitles=self.subs.isChecked(), auto_subtitles=self.auto_subs.isChecked(),
             subtitle_languages=self.sub_lang.text().strip(), embed_subtitles=self.embed_subs.isChecked(),
             thumbnail=self.thumbnail.isChecked(), metadata=self.metadata.isChecked(), force=self.force.isChecked(),
+            keep_sidecars=self.keep_sidecars.isChecked(),
         )
         try:
             options.validate()

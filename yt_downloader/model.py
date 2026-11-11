@@ -114,6 +114,7 @@ class Options:
     thumbnail: bool = True
     metadata: bool = True
     force: bool = False
+    keep_sidecars: bool = False
 
     def validate(self):
         if not Path(self.folder).is_absolute():

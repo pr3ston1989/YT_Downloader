@@ -27,6 +27,8 @@ Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadani
 
 Domyślny szablon to `{channel}/{playlist}/{index} - {title} [{id}].{ext}`. Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.
 
+Domyślnie aplikacja osadza metadane i miniaturę w pliku multimedialnym. MKV może też przechować pełny plik `.info.json` jako załącznik wewnątrz kontenera. Aby zapisywać osobne kopie w folderze pobrań, włącz **Zachowuj osobne pliki z miniaturą i metadanymi**. Ustawienie dotyczy nowych zadań. Pliki z wcześniejszych pobrań pozostają na dysku.
+
 Subskrypcje sprawdzają wybrane zakładki kanału, gdy aplikacja działa, także w zasobniku. Pierwsze sprawdzenie uwzględnia materiały dostępne w tych zakładkach i pomija ID z historii. Autostart Windows i praca w zasobniku są domyślnie wyłączone.
 
 Subskrypcja wykonawcy z YouTube Music dodaje zadania w trybie audio. Gdy kanał wymaga logowania, jego subskrypcja czeka na **Zalogowano · ponów**, a pozostałe są sprawdzane zgodnie z harmonogramem. Usunięcie subskrypcji przerywa jej bieżący odczyt.

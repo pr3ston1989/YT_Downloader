@@ -336,25 +336,33 @@ def download(ydl, request, parameters, emit):
         if options.embed_subtitles and not options.audio_only:
             post.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
     if options.metadata:
-        post.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
+        post.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
+                     "add_infojson": extension == "mkv"})
     if options.thumbnail:
-        post.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
+        post.append({"key": "EmbedThumbnail", "already_have_thumbnail": options.keep_sidecars})
     languages = [re.escape(lang.strip())
                  for lang in options.subtitle_languages.split(",") if lang.strip()]
+    templates = {"default": str(stem).replace("%", "%%") + ".%(ext)s"}
+    if not options.keep_sidecars:
+        # run_worker sets the temporary directory to the parent-owned worker folder.
+        # Keep temporary inputs away from existing sidecars and clean them up on cancellation.
+        temporary = Path(tempfile.gettempdir())
+        templates.update(thumbnail=str(temporary / "cover").replace("%", "%%") + ".%(ext)s",
+                         infojson=str(temporary / "info.json").replace("%", "%%"))
     settings = {
         **parameters,
         "format": format_expression(options),
         "merge_output_format": options.container,
         "final_ext": extension,
-        "outtmpl": str(stem).replace("%", "%%") + ".%(ext)s",
+        "outtmpl": templates,
         "noplaylist": True,
         "windowsfilenames": True,
         "continuedl": True,
         "nopart": False,
         "overwrites": False,
         "writethumbnail": options.thumbnail,
-        "writeinfojson": options.metadata,
-        "writedescription": options.metadata,
+        "writeinfojson": options.metadata and options.keep_sidecars,
+        "writedescription": options.metadata and options.keep_sidecars,
         "writesubtitles": options.subtitles,
         "writeautomaticsub": options.subtitles and options.auto_subtitles,
         "extractor_args": {"youtube": {"skip": ["translated_subs"]}},

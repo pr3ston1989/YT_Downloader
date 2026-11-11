@@ -93,10 +93,15 @@ class MusicEngineTests(unittest.TestCase):
               patch.object(sys, "path", sys.path.copy()), patch.object(sys, "dont_write_bytecode")):
             work = Path(directory)
             source = work / "fixture.m4a"
-            subprocess.run([Path(runtime.ffmpeg) / "ffmpeg.exe", "-v", "error", "-f", "lavfi",
+            thumbnail = work / "fixture.png"
+            ffmpeg = Path(runtime.ffmpeg) / "ffmpeg.exe"
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi",
                             "-i", "sine=frequency=440:duration=0.3", "-c:a", "aac", source],
                            check=True, timeout=20, capture_output=True)
+            subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=32x32",
+                            "-frames:v", "1", thumbnail], check=True, timeout=20, capture_output=True)
             data_url = "data:audio/mp4;base64," + b64encode(source.read_bytes()).decode("ascii")
+            cover_url = "data:image/png;base64," + b64encode(thumbnail.read_bytes()).decode("ascii")
             entry = Entry("MgNrAu2pzNs", "Utwór testowy", "Wykonawca", "Album testowy", 2,
                           music=True, album="Album testowy", track_number=2)
             ydl = load_engine(runtime.engine)
@@ -109,25 +114,35 @@ class MusicEngineTests(unittest.TestCase):
                         "id": entry.id, "title": entry.title, "url": data_url,
                         "ext": "m4a", "acodec": "aac", "vcodec": "none",
                         "artist": entry.channel, "description": "Audio test",
+                        "thumbnails": [{"url": cover_url, "ext": "png"}],
                         "extractor": "generic", "extractor_key": "Generic",
                     }, download=download)
 
-            events = []
-            options = Options(folder=str(work / "downloads"), audio_only=True, audio_format="m4a",
-                              thumbnail=False)
-            with patch("yt_downloader.worker.tempfile.gettempdir", return_value=directory):
-                download(Fixture, {"entry": asdict(entry), "options": asdict(options), "job_id": 1},
-                         {"quiet": True, "logger": MagicMock(), "ffmpeg_location": runtime.ffmpeg},
-                         lambda kind, **values: events.append((kind, values)))
-            self.assertEqual(extracted, [TRACK])
-            path = next(values["path"] for kind, values in events if kind == "done")
-            probe = subprocess.run([Path(runtime.ffmpeg) / "ffprobe.exe", "-v", "error",
-                                    "-show_entries", "format_tags=title,artist,album,track",
-                                    "-of", "json", path],
-                                   check=True, capture_output=True, encoding="utf-8", timeout=20)
-            self.assertEqual(json.loads(probe.stdout)["format"]["tags"],
-                             {"title": "Utwór testowy", "artist": "Wykonawca",
-                              "album": "Album testowy", "track": "2"})
+            for keep_sidecars in (False, True):
+                with self.subTest(keep_sidecars=keep_sidecars):
+                    events = []
+                    options = Options(folder=str(work / str(keep_sidecars)), audio_only=True,
+                                      audio_format="m4a", keep_sidecars=keep_sidecars)
+                    with patch("yt_downloader.worker.tempfile.gettempdir", return_value=directory):
+                        download(Fixture, {"entry": asdict(entry), "options": asdict(options), "job_id": 1},
+                                 {"quiet": True, "logger": MagicMock(), "ffmpeg_location": runtime.ffmpeg},
+                                 lambda kind, **values: events.append((kind, values)))
+                    path = Path(next(values["path"] for kind, values in events if kind == "done"))
+                    files = {path}
+                    if keep_sidecars:
+                        files.update(path.with_suffix(suffix) for suffix in (".png", ".info.json", ".description"))
+                    self.assertEqual(set(path.parent.iterdir()), files)
+                    self.assertFalse((work / "cover.png").exists())
+                    probe = subprocess.run([Path(runtime.ffmpeg) / "ffprobe.exe", "-v", "error",
+                                            "-show_entries", "format_tags=title,artist,album,track,description:stream_disposition=attached_pic",
+                                            "-of", "json", path], check=True, capture_output=True,
+                                           encoding="utf-8", timeout=20)
+                    info = json.loads(probe.stdout)
+                    self.assertEqual(info["format"]["tags"],
+                                     {"title": "Utwór testowy", "artist": "Wykonawca", "album": "Album testowy",
+                                      "track": "2", "description": "Audio test"})
+                    self.assertTrue(any(stream["disposition"]["attached_pic"] for stream in info["streams"]))
+            self.assertEqual(extracted, [TRACK, TRACK])
 
 
 if __name__ == "__main__":
