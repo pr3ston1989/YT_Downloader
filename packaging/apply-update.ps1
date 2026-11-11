@@ -12,7 +12,18 @@ $detail = ""
 try {
     $parent = Get-Process -Id $ParentId -ErrorAction SilentlyContinue
     if ($parent -and -not $parent.WaitForExit(30000)) { throw "Timeout waiting for application." }
-    if ((Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash -ne $ExpectedHash) {
+    $file = [System.IO.File]::OpenRead($Installer)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $actualHash = [BitConverter]::ToString($sha256.ComputeHash($file)).Replace("-", "")
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $file.Dispose()
+    }
+    if ($actualHash -ne $ExpectedHash) {
         throw "SHA-256 verification failed."
     }
     $target = Split-Path -Parent $AppExe

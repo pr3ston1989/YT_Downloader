@@ -86,5 +86,8 @@ def restart_for(update: AppUpdate, *, tray=False):
             "-Version", update.version]
     if tray:
         args.append("-Tray")
-    subprocess.Popen(args, creationflags=HIDE_WINDOW, env=external_env(), cwd=script.parent,
+    # Windows PowerShell needs its own module paths, even if the app was launched from PowerShell 7.
+    env = {key: value for key, value in external_env().items() if key.upper() != "PSMODULEPATH"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(args, creationflags=HIDE_WINDOW, env=env, cwd=script.parent,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

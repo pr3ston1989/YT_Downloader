@@ -54,7 +54,9 @@ def verify(previous, expected):
     executable = target / "YTDownloader.exe"
     original = sha256(executable)
     root = data / "YTDownloader"
-    env = {**os.environ, "LOCALAPPDATA": str(data), "QT_QPA_PLATFORM": "offscreen"}
+    # Model a launch from Explorer rather than inheriting the runner's PowerShell 7 module paths.
+    env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+    env.update(LOCALAPPDATA=str(data), QT_QPA_PLATFORM="offscreen")
     app = subprocess.Popen([executable], env=env, creationflags=subprocess.CREATE_NO_WINDOW)
     history = []
     try:

@@ -1,6 +1,10 @@
 import hashlib
 import io
+import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -97,6 +101,24 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract(archive, self.root, "yt-dlp")
         self.assertFalse((self.root.parent / "escape.py").exists())
+
+    def test_windows_upgrade_helper_rejects_a_mismatched_hash(self):
+        work = Path(self.work.name)
+        script = work / "apply-update.ps1"
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "packaging" / script.name, script)
+        installer = work / "candidate.exe"
+        installer.write_bytes(b"tampered test data")
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+        subprocess.run([
+            powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
+            "-ParentId", "2147483647", "-AppExe", work / "absent.exe", "-Installer", installer,
+            "-ExpectedHash", "0" * 64, "-Version", "v1.0.3",
+        ], check=True, timeout=20, env=env, creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True)
+        report = json.loads((work / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["detail"], "SHA-256 verification failed.")
 
 
 if __name__ == "__main__":
