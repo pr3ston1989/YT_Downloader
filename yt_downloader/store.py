@@ -1,10 +1,11 @@
 from dataclasses import asdict, dataclass
+from itertools import repeat
 import json
 from pathlib import Path
 import sqlite3
 import time
 
-from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, Preferences, VIDEO_ID
+from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, Preferences, VIDEO_ID, WAITING_STATES
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ class Store:
                 state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
                 recovery INTEGER NOT NULL DEFAULT 0, auth_attempts INTEGER NOT NULL DEFAULT 0,
                 ready REAL NOT NULL DEFAULT 0,
-                reason TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT ''
+                reason TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', queue_position INTEGER
             );
             CREATE INDEX IF NOT EXISTS job_state ON jobs (state, ready);
             CREATE INDEX IF NOT EXISTS job_video ON jobs (video_id, state);
@@ -52,8 +53,11 @@ class Store:
                 UNIQUE(url, tabs)
             );
         """)
-        if "auth_attempts" not in {column["name"] for column in self.db.execute("PRAGMA table_info(jobs)")}:
+        columns = {column["name"] for column in self.db.execute("PRAGMA table_info(jobs)")}
+        if "auth_attempts" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0")
+        if "queue_position" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN queue_position INTEGER")
         columns = {column["name"] for column in self.db.execute("PRAGMA table_info(subscriptions)")}
         for name in ("needs_login", "music"):
             if name not in columns:
@@ -80,19 +84,28 @@ class Store:
     def preferences(self):
         return Preferences.from_dict(self.get("settings", {}))
 
-    def enqueue(self, entries, options: Options, *, only_new=False):
+    def enqueue(self, entries, options: Options, *, only_new=False, first=False):
         encoded = json.dumps(asdict(options), ensure_ascii=False)
-        rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), encoded) for entry in entries)
         with self.db:
+            positions = repeat(None)
+            if first:
+                entries = list(entries)
+                self.db.execute("BEGIN IMMEDIATE")
+                # Normal jobs sort by their positive ID. Reserve earlier positions for this batch.
+                smallest = self.db.execute("SELECT MIN(queue_position) FROM jobs").fetchone()[0]
+                end = min(0, smallest or 0)
+                positions = range(end - len(entries), end)
+            rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), encoded, position)
+                    for entry, position in zip(entries, positions))
             if only_new:
                 return self.db.executemany("""
-                    INSERT INTO jobs (video_id,entry,options)
-                    SELECT ?1, ?2, ?3
+                    INSERT INTO jobs (video_id,entry,options,queue_position)
+                    SELECT ?1, ?2, ?3, ?4
                     WHERE NOT EXISTS (SELECT 1 FROM downloads WHERE id=?1)
                     AND NOT EXISTS (SELECT 1 FROM jobs WHERE video_id=?1 AND state NOT IN ('skipped','failed'))
                 """, rows).rowcount
             return self.db.executemany(
-                "INSERT INTO jobs (video_id,entry,options) VALUES (?,?,?)", rows).rowcount
+                "INSERT INTO jobs (video_id,entry,options,queue_position) VALUES (?,?,?,?)", rows).rowcount
 
     @staticmethod
     def job(row):
@@ -101,7 +114,34 @@ class Store:
                    row["reason"], row["path"])
 
     def jobs(self):
-        return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY id")]
+        return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY COALESCE(queue_position, id)")]
+
+    def move_jobs(self, ids, direction):
+        selected = set(ids)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in WAITING_STATES)
+            rows = self.db.execute(f"""
+                SELECT id, COALESCE(queue_position, id) AS position FROM jobs
+                WHERE state IN ({placeholders}) ORDER BY position
+            """, WAITING_STATES).fetchall()
+            order = [row["id"] for row in rows]
+            if direction == "first":
+                order.sort(key=lambda job_id: job_id not in selected)
+            elif direction == "last":
+                order.sort(key=lambda job_id: job_id in selected)
+            elif direction in ("up", "down"):
+                up = direction == "up"
+                indexes = range(1, len(order)) if up else range(len(order) - 2, -1, -1)
+                for index in indexes:
+                    neighbor = index - 1 if up else index + 1
+                    if order[index] in selected and order[neighbor] not in selected:
+                        order[index], order[neighbor] = order[neighbor], order[index]
+            else:
+                raise ValueError(f"Unknown queue move: {direction}")
+            return self.db.executemany("UPDATE jobs SET queue_position=? WHERE id=?",
+                                       ((row["position"], job_id) for row, job_id in zip(rows, order)
+                                        if row["id"] != job_id)).rowcount
 
     def skip_downloaded(self):
         with self.db:
@@ -114,15 +154,13 @@ class Store:
     def claim(self):
         with self.db:
             row = self.db.execute("""
-                SELECT j.* FROM jobs j
-                WHERE j.state='queued' AND j.ready<=?
+                UPDATE jobs SET state='running', reason='' WHERE id=(
+                    SELECT j.id FROM jobs j WHERE j.state='queued' AND j.ready<=?
                     AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
-                ORDER BY j.id LIMIT 1
+                    ORDER BY COALESCE(j.queue_position, j.id) LIMIT 1
+                ) RETURNING *
             """, (time.time(),)).fetchone()
-            if row:
-                self.db.execute("UPDATE jobs SET state='running', reason='' WHERE id=?", (row["id"],))
-                return self.job(row)
-        return None
+            return self.job(row) if row else None
 
     def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None):
         with self.db:

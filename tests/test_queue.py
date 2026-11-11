@@ -37,6 +37,42 @@ class QueueTests(unittest.TestCase):
         self.store.recover_interrupted()
         self.assertEqual([job.state for job in self.store.jobs()], ["paused", "queued"])
 
+    def test_reorder_moves_selected_jobs_together_and_preserves_the_order_on_reopen(self):
+        self.store.enqueue([replace(self.entry, id=f"v{i:010}") for i in range(1, 8)], self.options)
+        self.assertEqual(self.store.claim().id, 1)
+        self.store.state(4, "paused")
+        self.store.move_jobs([4, 6], "up")
+        self.assertEqual([job.id for job in self.store.jobs()], [1, 2, 4, 3, 6, 5, 7])
+        self.store.move_jobs([4, 6], "down")
+        self.assertEqual([job.id for job in self.store.jobs()], [1, 2, 3, 4, 5, 6, 7])
+        self.store.move_jobs([6, 4, 1], "first")
+        self.store.move_jobs([3], "last")
+        self.store.enqueue([replace(self.entry, id="v0000000008")], self.options)
+        with closing(Store(self.root)) as reopened:
+            self.assertEqual([job.id for job in reopened.jobs()], [1, 4, 6, 2, 5, 7, 3, 8])
+            self.assertEqual([job.state for job in reopened.jobs()[:2]], ["running", "paused"])
+            self.assertEqual(reopened.claim().id, 6)
+
+    def test_priority_batch_keeps_its_order_and_skips_tasks_waiting_for_a_retry(self):
+        entries = [replace(self.entry, id=f"v{i:010}") for i in range(1, 6)]
+        self.store.enqueue(entries[:2], self.options)
+        self.store.enqueue(entries[2:4], self.options, first=True)
+        self.store.enqueue(entries[4:], self.options, first=True)
+        self.assertEqual([job.id for job in self.store.jobs()], [5, 3, 4, 1, 2])
+        self.store.state(5, "queued", delay=3600)
+        self.assertEqual([self.store.claim().id for _ in range(4)], [3, 4, 1, 2])
+        self.assertIsNone(self.store.claim())
+
+    def test_queue_position_migration_keeps_the_existing_insertion_order(self):
+        root = self.root / "legacy-queue"
+        with closing(Store(root)) as legacy:
+            legacy.enqueue([replace(self.entry, id=f"v{i:010}") for i in range(1, 4)], self.options)
+            legacy.db.execute("ALTER TABLE jobs DROP COLUMN queue_position")
+        with closing(Store(root)) as migrated:
+            self.assertEqual([job.id for job in migrated.jobs()], [1, 2, 3])
+            migrated.move_jobs([3], "first")
+            self.assertEqual(migrated.claim().id, 3)
+
     def test_login_attempt_survives_interruption(self):
         self.store.enqueue([self.entry], self.options)
         job = self.store.claim()

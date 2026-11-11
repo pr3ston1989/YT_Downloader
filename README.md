@@ -33,6 +33,8 @@ Dla YouTube Music podgląd domyślnie wybiera **Tylko audio**. Zmień tryb przy 
 
 Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Gdy silnik wybierze inny strumień, aplikacja rozpoczyna pobieranie od początku. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
+W karcie **Kolejka** możesz przenieść zaznaczone oczekujące zadania **Na początek**, **Wyżej**, **Niżej** albo **Na koniec**. Przycisk **Pobierz następne** w podglądzie dodaje zaznaczone widoczne pozycje od razu na początek kolejki. Zadania ruszą, gdy zwolni się miejsce na pobranie. Jeśli kolejka jest wstrzymana, wznów ją. Aplikacja zachowuje kolejność po ponownym uruchomieniu.
+
 Domyślny szablon to `{source}/{index} - {title} [{id}].{ext}`. Pole `{source}` tworzy jeden folder nazwany od otwartej playlisty, albumu lub kanału. Pojedynczy film trafia do folderu kanału. Po aktualizacji poprzedni domyślny szablon w ustawieniach zmieni się automatycznie. Rozpoczęte pobrania mogą wznowić się w swoim dotychczasowym folderze.
 
 Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{source}`, `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.

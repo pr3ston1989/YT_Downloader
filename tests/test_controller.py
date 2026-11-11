@@ -121,6 +121,22 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(ready, ["new installer"])
         self.assertEqual([job.state for job in self.c.store.jobs()], ["done", "queued"])
 
+    def test_priority_download_gets_the_first_free_slot(self):
+        waiting = [Entry(f"v{i:010}", f"Film {i}") for i in range(100)]
+        current = self.enqueue(VIDEO, *waiting)
+        self.c.store.enqueue([NEXT_VIDEO], self.c.prefs.options, first=True)
+        self.c.step()
+        self.assertEqual(list(self.c.active), [1])
+        self.assertFalse(current.closed)
+
+        current.finish(kind="done", path="film.mp4")
+        self.c.step()
+        urgent, = self.c.active.values()
+        self.assertEqual(urgent.job.entry, NEXT_VIDEO)
+        urgent.worker.finish(kind="done", path="pilny.mp4")
+        self.c.step()
+        self.assertEqual(self.c.active[2].job.entry, waiting[0])
+
     def test_subscription_rescans_without_duplicates_and_preserves_music_mode(self):
         sub_id = self.subscribe(music=True)
         self.c.step()

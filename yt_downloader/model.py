@@ -13,6 +13,7 @@ FIELDS = {"source", "channel", "playlist", "index", "title", "id", "ext"}
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 CHANNEL_TABS = ("videos", "shorts", "streams")
 TERMINAL = ("done", "skipped", "failed")
+WAITING_STATES = ("queued", "paused", "repair", "auth")
 SEASON_EPISODE = re.compile(r"(?<!\w)S([0-9]{1,2})\s*E([0-9]{1,4})(?!\w)", re.IGNORECASE)
 MARKED_EPISODE = re.compile(
     r"(?:(?<!\w)(?:odcinek|odc\.?|episode|ep\.?)\s*[:#-]?\s*|(?<!\w)#\s*)"

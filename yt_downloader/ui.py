@@ -10,7 +10,10 @@ import shutil
 import subprocess
 import winreg
 
-from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, QSortFilterProxyModel, Qt, QTimer, QUrl
+from PySide6.QtCore import (
+    QAbstractTableModel, QItemSelection, QItemSelectionModel, QLockFile, QModelIndex, QSortFilterProxyModel,
+    Qt, QTimer, QUrl,
+)
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
@@ -23,7 +26,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
 from .controller import Controller, LABELS
-from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, detect_episode_numbers, parse_source
+from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, WAITING_STATES, detect_episode_numbers, parse_source
 from .runtime import RESOURCES, atomic_bytes, command
 from .updates.application import restart_for
 
@@ -241,6 +244,7 @@ class QueueModel(TableModel):
                 self.dataChanged.emit(self.index(0, 0), self.index(len(rows) - 1, 5))
         else:
             self.replace(rows)
+        return not same_ids
 
     def cells(self, job):
         event = self.events.get(job.id, {})
@@ -526,7 +530,10 @@ class Window(QMainWindow):
         self.preview_info.setWordWrap(True)
         self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
         self.select_none_button = button("Odznacz wszystkie", lambda: self.select_visible(False))
-        self.add_button = button("Dodaj zaznaczone do kolejki", self.enqueue, primary=True)
+        self.add_button = button("Dodaj do kolejki", self.enqueue, primary=True)
+        self.add_button.setToolTip("Dodaj zaznaczone pozycje widoczne w podglądzie.")
+        self.add_first = button("Pobierz następne", lambda: self.enqueue(first=True))
+        self.add_first.setToolTip("Dodaj zaznaczone widoczne pozycje na początek kolejki. Ruszą w pierwszym wolnym miejscu.")
         self.preview_search = QLineEdit()
         self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
         self.preview_search.textChanged.connect(self.filter_preview)
@@ -542,11 +549,13 @@ class Window(QMainWindow):
         self.preview_parameters = button("Parametry pobierania…", self.edit_preview_options)
         self.preview_parameters.setEnabled(False)
         self.preview_mode.setEnabled(False)
+        self.preview_model.dataChanged.connect(lambda *_: self.refresh_preview_actions())
         self.set_preview_selectable(False)
         filter_row = row(self.preview_search, self.preview_order, self.preview_mode, self.preview_parameters)
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
-        layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button, self.add_button))
+        layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button,
+                             self.add_first, self.add_button))
         layout.addWidget(self.preview_table, 1)
         return page
 
@@ -555,6 +564,7 @@ class Window(QMainWindow):
         queue_layout = QVBoxLayout(page)
         self.queue_model = QueueModel()
         self.queue_table = table(self.queue_model, 0)
+        self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.queue_table.setColumnWidth(1, 139)
         self.queue_table.setColumnWidth(2, 116)
         self.queue_table.setColumnWidth(3, 92)
@@ -565,10 +575,17 @@ class Window(QMainWindow):
         self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
         self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
         self.retry_failed = button("Ponów nieudane", self.retry_failures)
+        self.move_first = button("Na początek", lambda: self.move_queue("first"))
+        self.move_up = button("Wyżej", lambda: self.move_queue("up"))
+        self.move_down = button("Niżej", lambda: self.move_queue("down"))
+        self.move_last = button("Na koniec", lambda: self.move_queue("last"))
+        for control in (self.move_first, self.move_up, self.move_down, self.move_last):
+            control.setToolTip("Zmień kolejność zaznaczonych zadań oczekujących na pobranie.")
         self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
         queue_layout.addWidget(row(self.pause_selected, self.resume_selected,
                                    self.pause_all, self.retry_failed,
                                    button("Wyczyść zakończone", self.clear_queue), None))
+        queue_layout.addWidget(row(self.move_first, self.move_up, self.move_down, self.move_last, None))
         queue_layout.addWidget(self.queue_table, 1)
         self.summary = QLabel()
         self.total = QProgressBar()
@@ -744,14 +761,16 @@ class Window(QMainWindow):
         self.preview_filter.setFilterFixedString(text.strip())
         self.select_all_button.setText("Zaznacz widoczne" if active else "Zaznacz wszystkie")
         self.select_none_button.setText("Odznacz widoczne" if active else "Odznacz wszystkie")
-        self.add_button.setText("Dodaj widoczne zaznaczone" if active else "Dodaj zaznaczone do kolejki")
+        self.add_button.setText("Dodaj widoczne" if active else "Dodaj do kolejki")
         self.refresh_preview_actions()
 
     def refresh_preview_actions(self):
         enabled = self.preview_model.checkable and self.preview_filter.rowCount() > 0
         self.select_all_button.setEnabled(enabled)
         self.select_none_button.setEnabled(enabled)
-        self.add_button.setEnabled(enabled)
+        can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
+        self.add_button.setEnabled(can_add)
+        self.add_first.setEnabled(can_add)
 
     def visible_rows(self):
         if not self.preview_search.text().strip() and not self.preview_model.positions:
@@ -814,7 +833,7 @@ class Window(QMainWindow):
                 self.preview_parameters.setText("Zmienione parametry…")
         dialog.deleteLater()
 
-    def enqueue(self):
+    def enqueue(self, *, first=False):
         options = self.options_for_preview()
         try:
             options.validate()
@@ -823,11 +842,17 @@ class Window(QMainWindow):
             return
         selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
         if selected:
-            count = self.c.store.enqueue((self.preview_model.entry_at(i) for i in selected), options)
+            count = self.c.store.enqueue((self.preview_model.entry_at(i) for i in selected), options, first=first)
             self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
-            self.notify(f"Dodano pozycji: {count}.")
+            message = f"Dodano {count} pozycji na początek kolejki." if first else f"Dodano pozycji: {count}."
+            if first and self.c.paused:
+                message += " Kolejka jest wstrzymana."
+            self.notify(message)
             self.refresh()
+            if first:
+                self.tabs.setCurrentWidget(self.queue_tab)
+                self.queue_table.scrollToTop()
 
     def selected_jobs(self):
         return [self.queue_model.jobs[index.row()] for index in self.queue_table.selectionModel().selectedRows()]
@@ -836,6 +861,23 @@ class Window(QMainWindow):
         jobs = self.selected_jobs()
         self.pause_selected.setEnabled(any(job.state in ("queued", "running", "repair") for job in jobs))
         self.resume_selected.setEnabled(any(job.state == "paused" for job in jobs))
+        selected = {job.id for job in jobs}
+        waiting = [job.id for job in self.queue_model.jobs if job.state in WAITING_STATES]
+        positions = [i for i, job_id in enumerate(waiting) if job_id in selected]
+        before = bool(positions) and positions[-1] >= len(positions)
+        after = bool(positions) and positions[0] < len(waiting) - len(positions)
+        self.move_first.setEnabled(before)
+        self.move_up.setEnabled(before)
+        self.move_down.setEnabled(after)
+        self.move_last.setEnabled(after)
+
+    def move_queue(self, direction):
+        selected = [job.id for job in self.selected_jobs() if job.state in WAITING_STATES]
+        if self.c.store.move_jobs(selected, direction):
+            self.refresh()
+            rows = [self.queue_model.positions[job_id] for job_id in selected]
+            edge = min(rows) if direction in ("first", "up") else max(rows)
+            self.queue_table.scrollTo(self.queue_model.index(edge, 0))
 
     def selected_action(self, action):
         for job in self.selected_jobs():
@@ -997,7 +1039,15 @@ class Window(QMainWindow):
         runtime = self.c.manager.snapshot()
         self.engine_label.setText(f"yt-dlp {runtime.version} · {runtime.channel}" if runtime.ready
                                   else "Przygotowywanie zależności")
-        self.queue_model.update_jobs(self.c.store.jobs())
+        selected = [job.id for job in self.selected_jobs()]
+        if self.queue_model.update_jobs(self.c.store.jobs()) and selected:
+            selection = QItemSelection()
+            for job_id in selected:
+                if job_id in self.queue_model.positions:
+                    index = self.queue_model.index(self.queue_model.positions[job_id], 0)
+                    selection.select(index, index)
+            flags = QItemSelectionModel.SelectionFlag
+            self.queue_table.selectionModel().select(selection, flags.ClearAndSelect | flags.Rows)
         self.refresh_login_actions()
         self.pause_all.setText("Wznów kolejkę" if self.c.paused else "Wstrzymaj kolejkę")
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))

@@ -77,6 +77,8 @@ def verify(previous, expected):
                              (json.dumps({"id": saved.id, "title": saved.title}),
                               json.dumps({"folder": options.folder}), job_id))
         store.state(job_id, "paused")
+        if version_tuple(previous) < (1, 1, 8):
+            store.db.execute("ALTER TABLE jobs DROP COLUMN queue_position")
     # Model a launch from Explorer rather than inheriting the runner's PowerShell 7 module paths.
     env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
     env.update(LOCALAPPDATA=str(data), QT_QPA_PLATFORM="offscreen")

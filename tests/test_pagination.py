@@ -210,6 +210,29 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertIn(0, self.window.preview_model.selected)
         self.assertNotIn(1, self.window.preview_model.selected)
 
+    def test_preview_can_add_a_visible_selection_to_the_front_of_the_queue(self):
+        store = self.controller.store
+        store.enqueue([entry(i) for i in range(100, 200)], self.controller.prefs.options)
+        self.send_page(1, 21, {"kind": "done"})
+        self.window.preview_search.setText("film 2")
+        self.window.select_visible(False)
+        self.window.preview_model.select_rows([19], True)
+        self.window.add_first.click()
+        self.assertEqual([job.entry.index for job in store.jobs()[:3]], [20, 100, 101])
+        self.assertIs(self.window.tabs.currentWidget(), self.window.queue_tab)
+
+    def test_queue_keeps_the_selected_job_when_moved_to_the_front(self):
+        store = self.controller.store
+        store.enqueue([entry(i) for i in range(1, 5)], self.controller.prefs.options)
+        self.window.tabs.setCurrentWidget(self.window.queue_tab)
+        self.window.queue_table.selectRow(3)
+        self.window.move_first.click()
+        self.assertEqual([job.id for job in store.jobs()], [4, 1, 2, 3])
+        self.assertEqual([job.id for job in self.window.selected_jobs()], [4])
+        self.assertFalse(self.window.move_first.isEnabled())
+        self.window.move_down.click()
+        self.assertEqual([job.id for job in store.jobs()], [1, 4, 2, 3])
+
     def test_music_preview_defaults_to_audio_without_changing_global_settings(self):
         self.controller.cancel_scan()
         self.window.source.setText("https://music.youtube.com/playlist?list=PLMusic")
