@@ -19,4 +19,3 @@ def icon():
 
 if __name__ == "__main__":
     icon()
-    standard_library()
