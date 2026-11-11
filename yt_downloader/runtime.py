@@ -30,7 +30,7 @@ def atomic_json(path: Path, data):
 
 
 def command(*args):
-    prefix = [sys.executable] if FROZEN else [sys.executable, "-m", "yt_downloader"]
+    prefix = [sys.executable] if FROZEN else [sys.executable, str(RESOURCES / "launcher.py")]
     return [*prefix, *map(str, args)]
 
 

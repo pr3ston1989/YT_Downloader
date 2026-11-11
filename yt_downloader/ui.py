@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import winreg
 
 from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, Qt, QTimer, QUrl
@@ -24,7 +23,7 @@ from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
 from .controller import Controller, LABELS
 from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, parse_source
-from .runtime import FROZEN, RESOURCES, atomic_bytes, command
+from .runtime import RESOURCES, atomic_bytes, command
 from .updates.application import restart_for
 
 
@@ -764,8 +763,6 @@ def autostart(enabled, tray):
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
         if enabled:
             args = command(*(["--tray"] if tray else []))
-            if not FROZEN:
-                args = [sys.executable, str(RESOURCES / "launcher.py"), *args[3:]]
             winreg.SetValueEx(key, "YTDownloader", 0, winreg.REG_SZ, subprocess.list2cmdline(args))
         else:
             try:

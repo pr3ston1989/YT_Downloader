@@ -29,12 +29,17 @@ jobs:
           python -m unittest discover -s tests -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\packaging\build.ps1 -Python python
-      - name: Smoke test frozen app
+      - name: Install and smoke test
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
-          $data = Join-Path (Get-Location) ".test-data\ci"
+          $installDir = Join-Path $env:RUNNER_TEMP "YT Downloader"
+          $setupArgs = "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOICONS",
+                       ('/DIR="' + $installDir + '"')
+          $setup = Start-Process -FilePath ".\dist\YTDownloader-Setup.exe" -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
+          if ($setup.ExitCode -ne 0) { exit $setup.ExitCode }
+          $data = Join-Path $env:RUNNER_TEMP "YT Downloader test"
           $smokeArgs = "--smoke-test", ('"' + $data + '"')
-          $app = Start-Process -FilePath ".\dist\YTDownloader\YTDownloader.exe" -ArgumentList $smokeArgs -Wait -PassThru -WindowStyle Hidden
+          $app = Start-Process -FilePath (Join-Path $installDir "YTDownloader.exe") -ArgumentList $smokeArgs -Wait -PassThru -WindowStyle Hidden
           if ($app.ExitCode -ne 0) {
             if (Test-Path "$data\app.log") { Get-Content "$data\app.log" }
             exit $app.ExitCode
