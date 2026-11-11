@@ -51,7 +51,7 @@ class Controller(QObject):
     scanned = Signal(object)
     scan_progress = Signal(int)
     message = Signal(str)
-    login_needed = Signal()
+    login_needed = Signal(str, str, bool)
     update_ready = Signal(object)
 
     def __init__(self, root: Path, *, smoke=False):
@@ -239,6 +239,7 @@ class Controller(QObject):
         if event.get("detail"):
             LOG.warning("Odczyt listy / %s", event["detail"])
         successful = event["kind"] == "done"
+        code = event.get("code")
         if scan.subscription:
             row = scan.subscription
             self.store.postpone_subscription(row["id"], row["hours"] * 3600 if successful else 900)
@@ -249,9 +250,11 @@ class Controller(QObject):
                     self.message.emit(f"Subskrypcja dodała {count} nowych pozycji.")
             self.changed.emit()
         else:
-            self.scanned.emit({**event, "entries": scan.entries, "warnings": scan.warnings})
-        if event.get("code") in ("auth", "cookies"):
-            self.login_needed.emit()
+            needs_login = code in ("auth", "cookies", "playlist_access")
+            self.scanned.emit({**event, "entries": scan.entries, "warnings": scan.warnings,
+                               "login_retry": (scan.source, scan.tabs) if needs_login else None})
+        if code in ("auth", "cookies") or (code == "playlist_access" and not scan.subscription):
+            self.login_needed.emit(scan.source.url, event["message"], code == "auth")
 
     def recovery_channel(self, recovery):
         return "nightly" if recovery or self.prefs.channel == "nightly" else "stable"
@@ -299,10 +302,10 @@ class Controller(QObject):
             self.pending_repairs[job.id] = self.recovery_channel(job.recovery)
         elif code in ("auth", "cookies") and not job.auth_attempts:
             self.store.state(job.id, "auth", reason)
-            self.login_needed.emit()
+            self.login_needed.emit(f"https://www.youtube.com/watch?v={job.entry.id}", reason, code == "auth")
         else:
             if code == "auth":
-                reason = "Konto nie uzyskało dostępu do materiału po ponowieniu logowania."
+                reason += " Ponowienie po zalogowaniu nie dało dostępu."
             self.store.state(job.id, "failed", reason)
 
     def pause_job(self, job_id):

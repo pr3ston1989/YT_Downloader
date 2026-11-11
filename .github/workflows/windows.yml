@@ -67,6 +67,13 @@ jobs:
         with:
           name: windows-installer
           path: dist
+      - name: Read the previous published version
+        id: previous
+        run: |
+          $release = Invoke-RestMethod "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" -SkipHttpErrorCheck
+          if ($release.tag_name -and $release.tag_name -ne $env:GITHUB_REF_NAME) {
+            "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+          }
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,3 +81,8 @@ jobs:
           $version = python -c "from yt_downloader import APP_VERSION; print(APP_VERSION)"
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match app version." }
           gh release create $env:GITHUB_REF_NAME dist/YTDownloader-Setup.exe dist/YTDownloader-Setup.exe.sha256 --verify-tag --generate-notes --latest
+      - name: Verify automatic upgrade and restart
+        if: steps.previous.outputs.tag != ''
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: python -X utf8 packaging/verify_upgrade.py $env:PREVIOUS_TAG $env:GITHUB_REF_NAME

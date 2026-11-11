@@ -47,15 +47,23 @@ def probe_engine(path, report):
         return 1
 
 
-def explain(error):
+def explain(error, *, source_kind=None):
     text = str(error).casefold()
+    if "playlist is private" in text or "private playlist" in text:
+        return "auth", "Playlista jest prywatna. Zaloguj się na konto z dostępem do niej."
+    if source_kind == "playlist" and any(message in text for message in (
+            "playlist does not exist", "playlist is not available", "playlist is unavailable",
+            "playlist is not accessible")):
+        return "playlist_access", "Playlista jest niedostępna. Jeśli jest prywatna, zaloguj się na konto z dostępem."
     patterns = (
+        ("auth", "Film ma ograniczenie wiekowe. Zaloguj się na konto z dostępem do materiałów 18+.",
+         ("age-restricted", "age restriction", "confirm your age", "verify your age",
+          "age verification", "age-verification", "verification of your age")),
         ("auth", "Zaloguj się w przeglądarce, aby otworzyć ten materiał.",
-         ("sign in", "log in", "login required", "age-restricted", "age restriction",
-          "confirm your age", "members-only", "cookies are no longer valid", "private video",
-          "not a bot", "not available on this app")),
+         ("sign in", "log in", "login required", "requires authentication", "members-only",
+          "cookies are no longer valid", "private video", "video is private", "not a bot")),
         ("cookies", "Nie udało się odczytać ciasteczek. Sprawdź profil lub użyj Firefoksa.",
-         ("failed to load cookies", "could not copy", "could not find", "dpapi", "cookie database")),
+         ("failed to load cookies", "dpapi", "cookie database", "cookies database")),
         ("unavailable", "Film jest niedostępny, usunięty lub objęty blokadą regionalną.",
          ("unavailable", "has been removed", "not available in your country", "geo-restricted")),
         ("network", "Błąd sieci. Sprawdź połączenie z internetem.",
@@ -64,7 +72,7 @@ def explain(error):
           "name resolution", "urlopen error", "remote end closed", "incomplete read")),
         ("extractor", "Silnik nie odczytał strumieni YouTube.",
          ("unable to extract", "http error 403", "signature extraction", "nsig", "challenge solving",
-          "no video formats", "only images are available")),
+          "no video formats", "only images are available", "not available on this app")),
         ("format", "Film nie ma formatu pasującego do wybranych ustawień.",
          ("requested format is not available", "no matching format")),
         ("disk", "Nie można zapisać pliku. Sprawdź dostęp i wolne miejsce.",
@@ -112,7 +120,10 @@ def base_parameters(request, logger):
     if auth.get("browser"):
         result["cookiesfrombrowser"] = (auth["browser"], auth.get("profile") or None)
     elif auth.get("file") and Path(auth["file"]).is_file():
-        text = crypt(Path(auth["file"]).read_bytes(), decrypt=True).decode("utf-8")
+        try:
+            text = crypt(Path(auth["file"]).read_bytes(), decrypt=True).decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("Failed to load cookies from the encrypted file") from exc
         result["cookiefile"] = io.StringIO(text)
     return result
 
@@ -287,7 +298,7 @@ def run_worker(work):
             operation(ydl, request, parameters, emit)
             return 0
         except Exception as exc:
-            kind, message = explain(exc)
+            kind, message = explain(exc, source_kind=request.get("source", {}).get("kind"))
             if kind in {"format", "other"} and logger.extractor_warning:
                 kind, message = explain(logger.extractor_warning)
             emit("error", code=kind, message=message, detail=str(exc))

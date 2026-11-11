@@ -257,8 +257,8 @@ class Window(QMainWindow):
         self.app = app
         self.c = controller
         self.login_prompted = False
-        self.retry_source = None
-        self.last_preview = None
+        self.retry_preview = None
+        self.login_url = ""
         self.quitting = False
         self.setWindowTitle(APP_NAME)
         self.resize(1140, 790)
@@ -499,17 +499,25 @@ class Window(QMainWindow):
     def preview(self):
         try:
             source = parse_source(self.source.text())
-            tabs = [key for key, check in self.channel_tabs.items() if check.isChecked()]
-            if source.kind == "channel" and not tabs:
-                raise ValueError("Wybierz przynajmniej jedną zakładkę kanału.")
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        tabs = [key for key, check in self.channel_tabs.items() if check.isChecked()]
+        if source.kind == "channel" and not tabs:
+            self.notify("Wybierz przynajmniej jedną zakładkę kanału.")
+            return
+        self.start_preview(source, tabs)
+
+    def start_preview(self, source, tabs):
+        try:
             self.c.preview(source, tabs)
         except ValueError as exc:
             self.notify(str(exc))
             return
         if not self.c.scan:
             return
-        self.last_preview = self.source.text()
-        self.retry_source = None
+        self.retry_preview = None
+        self.refresh_login_actions()
         self.preview_button.setEnabled(False)
         self.cancel_button.show()
         self.preview_info.setText("Odczytywanie listy…")
@@ -529,8 +537,7 @@ class Window(QMainWindow):
                                       (f" · pominięte zakładki: {warnings}" if warnings else ""))
         else:
             self.preview_info.setText(result["message"])
-            if result.get("code") in ("auth", "cookies"):
-                self.retry_source = self.last_preview
+            self.retry_preview = result["login_retry"]
 
     def enqueue(self):
         try:
@@ -629,16 +636,19 @@ class Window(QMainWindow):
         (self.c.root / "cookies.dpapi").unlink(missing_ok=True)
         self.notify("Usunięto zaimportowane ciasteczka.")
 
-    def login_needed(self):
+    def login_needed(self, url, message, open_browser):
+        self.login_url = url
         self.login.show()
         self.retry_login.show()
-        self.notify("Materiał wymaga zalogowania. W ustawieniach wybierz przeglądarkę lub zaimportuj ciasteczka.")
-        if not self.login_prompted:
+        self.notify(message)
+        if open_browser and not self.login_prompted:
             self.login_prompted = True
             self.open_login()
 
     def open_login(self):
-        url = "https://www.youtube.com/"
+        url = self.retry_preview[0].url if self.retry_preview else self.login_url
+        if not url:
+            return
         exe_name = {"chrome": "chrome", "edge": "msedge", "firefox": "firefox",
                     "brave": "brave", "opera": "opera", "vivaldi": "vivaldi"}.get(self.c.prefs.browser)
         if exe_name:
@@ -652,12 +662,26 @@ class Window(QMainWindow):
         QDesktopServices.openUrl(QUrl(url))
 
     def retry_after_login(self):
+        if not self.c.prefs.browser and not (self.c.root / "cookies.dpapi").is_file():
+            self.tabs.setCurrentIndex(1)
+            self.notify("Wybierz przeglądarkę w ustawieniach i zapisz wybór albo zaimportuj ciasteczka.")
+            return
+        self.tabs.setCurrentIndex(0)
+        if self.retry_preview:
+            source, tabs = self.retry_preview
+            self.source.setText(source.url)
+            for tab, check in self.channel_tabs.items():
+                check.setChecked(tab in tabs)
+            self.start_preview(source, tabs)
         self.c.retry_auth()
-        if self.retry_source:
-            self.source.setText(self.retry_source)
-            self.preview()
-        self.login.hide()
-        self.retry_login.hide()
+
+    def refresh_login_actions(self):
+        waiting = next((job for job in self.queue_model.jobs if job.state == "auth"), None)
+        if waiting:
+            self.login_url = f"https://www.youtube.com/watch?v={waiting.entry.id}"
+        visible = bool(waiting or self.retry_preview)
+        self.login.setVisible(visible)
+        self.retry_login.setVisible(visible)
 
     def add_subscription(self):
         try:
@@ -686,6 +710,7 @@ class Window(QMainWindow):
         self.engine_label.setText(f"yt-dlp {runtime.version} · {runtime.channel}" if runtime.ready
                                   else "Przygotowywanie zależności")
         self.queue_model.update_jobs(self.c.store.jobs())
+        self.refresh_login_actions()
         self.pause_all.setText("Wznów kolejkę" if self.c.paused else "Wstrzymaj kolejkę")
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))
         self.selection_state()

@@ -7,7 +7,11 @@ Aplikacja desktopowa dla Windows 10/11 x64. Interfejs PySide6 obsługuje podglą
 1. Pobierz `YTDownloader-Setup.exe` z [wydań GitHub](https://github.com/pr3ston1989/YT_Downloader/releases). Instalator tworzy skrót w menu Start i opcjonalny skrót na pulpicie, domyślnie zaznaczony.
 2. Wklej adres filmu, playlisty albo kanału. Dla kanału wybierz **Filmy**, **Shorty** lub **Transmisje**. Link z parametrem `list` otwiera playlistę.
 3. Kliknij **Pokaż podgląd**, odznacz zbędne pozycje i dodaj zaznaczone do kolejki. Jakość, folder i format ustawisz w zakładce **Ustawienia**. Każde zadanie zachowuje ustawienia obowiązujące w chwili dodania.
-4. Jeśli materiał wymaga konta, zaloguj się w wybranej przeglądarce. W ustawieniach wskaż przeglądarkę i ewentualnie profil, następnie kliknij **Zalogowano · ponów**. Możesz też zaimportować plik Netscape. Aplikacja zachowuje tylko wpisy YouTube i szyfruje je przez Windows DPAPI dla bieżącego użytkownika. Jeśli przeglądarka blokuje odczyt ciasteczek, użyj Firefoksa lub importu.
+4. Jeśli YouTube prosi o zalogowanie, aplikacja otworzy link do materiału w przeglądarce. W **Ustawieniach** wybierz przeglądarkę i ewentualnie profil, w którym logujesz się do YouTube. Zapisz ustawienia i kliknij **Zalogowano · ponów**. Aplikacja ponownie odczyta podgląd lub uruchomi zadania czekające na logowanie.
+
+Prywatna playlista wymaga konta, które może ją otworzyć w przeglądarce. Film 18+ wymaga konta dopuszczonego przez YouTube do oglądania treści z ograniczeniem wiekowym. Jeśli YouTube prosi o potwierdzenie wieku, wykonaj je w przeglądarce. [Dokumentacja YouTube](https://support.google.com/youtube/answer/10070779?hl=pl)
+
+Jeśli przeglądarka blokuje odczyt ciasteczek, wybierz zalogowany profil Firefoksa lub zaimportuj plik Netscape. Z importowanego pliku aplikacja zachowuje tylko ciasteczka YouTube. Szyfruje je przez Windows DPAPI dla bieżącego użytkownika i przekazuje do yt-dlp w pamięci.
 
 Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
