@@ -4,3 +4,4 @@ mutagen
 requests
 websockets
 brotli
+curl_cffi>=0.13,<1

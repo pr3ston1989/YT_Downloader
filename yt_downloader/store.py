@@ -15,6 +15,7 @@ class Job:
     state: str
     attempts: int
     recovery: int
+    auth_attempts: int
     reason: str
     path: str
 
@@ -31,7 +32,8 @@ class Store:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id TEXT NOT NULL, entry TEXT NOT NULL, options TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
-                recovery INTEGER NOT NULL DEFAULT 0, ready REAL NOT NULL DEFAULT 0,
+                recovery INTEGER NOT NULL DEFAULT 0, auth_attempts INTEGER NOT NULL DEFAULT 0,
+                ready REAL NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS job_state ON jobs (state, ready);
@@ -48,6 +50,8 @@ class Store:
                 hours INTEGER NOT NULL, due REAL NOT NULL, UNIQUE(url, tabs)
             );
         """)
+        if "auth_attempts" not in {column["name"] for column in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0")
 
     def close(self):
         self.db.close()
@@ -81,7 +85,8 @@ class Store:
     @staticmethod
     def job(row):
         return Job(row["id"], Entry(**json.loads(row["entry"])), Options(**json.loads(row["options"])),
-                   row["state"], row["attempts"], row["recovery"], row["reason"], row["path"])
+                   row["state"], row["attempts"], row["recovery"], row["auth_attempts"],
+                   row["reason"], row["path"])
 
     def jobs(self):
         return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY id")]
@@ -126,8 +131,17 @@ class Store:
 
     def retry_failed(self):
         with self.db:
-            self.db.execute("UPDATE jobs SET state='queued', reason='', attempts=0, recovery=0, ready=0 "
-                            "WHERE state='failed'")
+            self.db.execute("""
+                UPDATE jobs SET state='queued', reason='', attempts=0, recovery=0, auth_attempts=0, ready=0
+                WHERE state='failed'
+            """)
+
+    def retry_auth(self):
+        with self.db:
+            self.db.execute("""
+                UPDATE jobs SET state='queued', reason='', ready=0, auth_attempts=auth_attempts+1
+                WHERE state='auth'
+            """)
 
     def clear_jobs(self):
         with self.db:

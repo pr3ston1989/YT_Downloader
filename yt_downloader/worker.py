@@ -10,17 +10,18 @@ import time
 
 from .auth import crypt
 from .model import Entry, Options, VIDEO_ID, output_stem
-from .runtime import RESOURCES, atomic_json
+from .runtime import atomic_json
 
 
 def load_engine(path):
     root = Path(path)
     if not (root / "yt_dlp" / "__init__.py").is_file():
         raise FileNotFoundError("Brak silnika yt-dlp.")
-    standard_library = RESOURCES / "runtime-stdlib.zip"
-    if standard_library.is_file():
-        sys.path.append(str(standard_library))
     sys.dont_write_bytecode = True
+    # A Windows GUI-subsystem executable can start without standard streams.
+    for name in ("stdin", "stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "r" if name == "stdin" else "w", encoding="utf-8"))
     sys.path.insert(0, str(root))
     from yt_dlp import YoutubeDL
     return YoutubeDL
@@ -228,7 +229,7 @@ def download(ydl, request, parameters, emit):
         post.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
     if options.thumbnail:
         post.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
-    languages = [re.escape(lang.strip()) + r"(?:[-_].*)?"
+    languages = [re.escape(lang.strip())
                  for lang in options.subtitle_languages.split(",") if lang.strip()]
     settings = {
         **parameters,
@@ -246,6 +247,7 @@ def download(ydl, request, parameters, emit):
         "writedescription": options.metadata,
         "writesubtitles": options.subtitles,
         "writeautomaticsub": options.subtitles and options.auto_subtitles,
+        "extractor_args": {"youtube": {"skip": ["translated_subs"]}},
         "subtitleslangs": languages,
         "progress_hooks": [progress],
         "postprocessor_hooks": [processing],

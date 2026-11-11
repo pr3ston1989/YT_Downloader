@@ -66,7 +66,8 @@ def read_result(root, record):
     path = root / "app-update" / "result.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-        record("aplikacja", data["version"], data["status"], data["detail"])
+        status = "zainstalowano" if data["status"] == "installed" else "błąd instalacji"
+        record("aplikacja", data["version"], status, data["detail"])
     except FileNotFoundError:
         return
     except (ValueError, KeyError, OSError) as exc:

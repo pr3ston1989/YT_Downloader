@@ -34,6 +34,15 @@ class QueueTests(unittest.TestCase):
         self.store.recover_interrupted()
         self.assertEqual([job.state for job in self.store.jobs()], ["paused", "queued"])
 
+    def test_login_attempt_survives_interruption(self):
+        self.store.enqueue([self.entry], self.options)
+        job = self.store.claim()
+        self.store.state(job.id, "auth")
+        self.store.retry_auth()
+        self.store.claim()
+        self.store.recover_interrupted()
+        self.assertEqual(self.store.claim().auth_attempts, 1)
+
     def test_windows_path_is_safe_and_keeps_video_id(self):
         entry = replace(self.entry, title='CON: ? <>', channel="NUL", playlist="..")
         path = output_stem(entry, self.options, 1)

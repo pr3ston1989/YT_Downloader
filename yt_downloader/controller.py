@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
 from pathlib import Path
+import shutil
 from threading import Thread
 import time
 
@@ -56,6 +57,8 @@ class Controller(QObject):
     def __init__(self, root: Path, *, smoke=False):
         super().__init__()
         self.root = root
+        for path in (root / "workers").glob("worker-*"):
+            shutil.rmtree(path, ignore_errors=True)
         self.store = Store(root)
         self.prefs = self.store.preferences()
         self.manager = EngineManager(root / "engine", self.record)
@@ -294,10 +297,12 @@ class Controller(QObject):
                 return
             self.store.state(job.id, "repair", reason, recovery=job.recovery + 1)
             self.pending_repairs[job.id] = self.recovery_channel(job.recovery)
-        elif code in ("auth", "cookies"):
+        elif code in ("auth", "cookies") and not job.auth_attempts:
             self.store.state(job.id, "auth", reason)
             self.login_needed.emit()
         else:
+            if code == "auth":
+                reason = "Konto nie uzyskało dostępu do materiału po ponowieniu logowania."
             self.store.state(job.id, "failed", reason)
 
     def pause_job(self, job_id):
@@ -325,9 +330,7 @@ class Controller(QObject):
         self.changed.emit()
 
     def retry_auth(self):
-        for job in self.store.jobs():
-            if job.state == "auth":
-                self.store.state(job.id, "queued")
+        self.store.retry_auth()
         self.changed.emit()
 
     def tick(self):
