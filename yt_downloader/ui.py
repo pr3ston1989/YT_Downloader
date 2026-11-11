@@ -13,9 +13,9 @@ import winreg
 from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, QSortFilterProxyModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox,
     QStyle, QStyleOptionProgressBar, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
     QTableView, QVBoxLayout, QWidget,
 )
@@ -277,152 +277,11 @@ def set_theme(app, theme):
     """)
 
 
-class Window(QMainWindow):
-    def __init__(self, app, controller):
-        super().__init__()
-        self.app = app
-        self.c = controller
-        self.login_prompted = False
-        self.retry_preview = None
-        self.login_url = ""
-        self.quitting = False
-        self.setWindowTitle(APP_NAME)
-        self.resize(1140, 790)
-        self.setMinimumSize(870, 620)
-        self.tabs = QTabWidget()
-        self.notice = QLabel("Przygotowywanie zależności…")
-        self.notice.setObjectName("muted")
-        self.notice.setWordWrap(True)
-        self.login = button("Zaloguj w przeglądarce", self.open_login)
-        self.retry_login = button("Zalogowano · ponów", self.retry_after_login)
-        self.login.hide()
-        self.retry_login.hide()
-        self.engine_label = QLabel()
-        self.engine_label.setObjectName("muted")
-        brand = QLabel(APP_NAME)
-        brand.setObjectName("brand")
-        center = QWidget()
-        self.setCentralWidget(center)
-        layout = QVBoxLayout(center)
-        layout.setContentsMargins(20, 14, 20, 14)
-        layout.setSpacing(11)
-        layout.addWidget(row(brand, None, self.engine_label))
-        layout.addWidget(self.tabs, 1)
-        layout.addWidget(row(self.notice, None, self.login, self.retry_login))
-        self.tabs.addTab(self.download_page(), "Pobieranie")
-        self.tabs.addTab(self.settings_page(), "Ustawienia")
-        self.tabs.addTab(self.history_page(), "Historia pobrań")
-        self.tabs.addTab(self.updates_page(), "Aktualizacje")
-        self.tabs.addTab(self.subscriptions_page(), "Subskrypcje")
-        self.tabs.currentChanged.connect(lambda _: self.refresh())
-        self.tray = QSystemTrayIcon(app.windowIcon(), self)
-        menu = QMenu(self)
-        menu.addAction("Pokaż YT Downloader", self.showNormal)
-        menu.addAction("Wstrzymaj / wznów kolejkę", lambda: self.c.pause_all(not self.c.paused))
-        menu.addAction("Zakończ", self.quit)
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda reason: self.showNormal()
-                                    if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-        self.tray.setToolTip(APP_NAME)
-        self.tray.setVisible(self.c.prefs.tray and QSystemTrayIcon.isSystemTrayAvailable())
-        self.c.changed.connect(self.refresh)
-        self.c.progress.connect(self.on_progress)
-        self.c.message.connect(self.notify)
-        self.c.scanned.connect(self.on_scan)
-        self.c.scan_entries.connect(self.on_scan_entries)
-        self.c.login_needed.connect(self.login_needed)
-        self.c.update_ready.connect(self.apply_app_update)
-        self.refresh()
-
-    def download_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        self.source = QLineEdit()
-        self.source.setPlaceholderText("Wklej link z YouTube lub YouTube Music")
-        self.source_kind = QLabel()
-        self.source_kind.setObjectName("muted")
-        self.source.textChanged.connect(self.detect)
-        self.source.returnPressed.connect(self.preview)
-        self.preview_button = button("Pokaż podgląd", self.preview, primary=True)
-        self.cancel_button = button("Anuluj odczyt", self.c.cancel_scan)
-        self.cancel_button.hide()
-        source_row = row(self.source, self.source_kind, self.preview_button, self.cancel_button)
-        source_row.layout().setStretch(0, 1)
-        layout.addWidget(source_row)
-        self.channel_tabs = {key: checkbox(name, True) for key, name in TAB_NAMES.items()}
-        self.channel_row = row(*self.channel_tabs.values(), None)
-        self.channel_row.hide()
-        layout.addWidget(self.channel_row)
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        preview_box = QWidget()
-        preview_layout = QVBoxLayout(preview_box)
-        preview_layout.setContentsMargins(0, 0, 0, 4)
-        self.preview_model = PreviewModel()
-        self.preview_filter = QSortFilterProxyModel(self)
-        self.preview_filter.setSourceModel(self.preview_model)
-        self.preview_filter.setFilterKeyColumn(2)
-        self.preview_filter.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.preview_table = table(self.preview_filter, 2)
-        self.preview_table.setColumnWidth(0, 72)
-        self.preview_table.setColumnWidth(1, 44)
-        self.preview_table.setColumnWidth(4, 64)
-        self.preview_info = QLabel("Podgląd")
-        self.preview_info.setWordWrap(True)
-        self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
-        self.select_none_button = button("Odznacz wszystkie", lambda: self.select_visible(False))
-        self.add_button = button("Dodaj zaznaczone do kolejki", self.enqueue, primary=True)
-        self.preview_search = QLineEdit()
-        self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
-        self.preview_search.textChanged.connect(self.filter_preview)
-        self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
-        self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
-        self.set_preview_selectable(False)
-        filter_row = row(self.preview_search, self.preview_mode)
-        filter_row.layout().setStretch(0, 1)
-        preview_layout.addWidget(filter_row)
-        preview_layout.addWidget(row(self.preview_info, None, self.select_all_button,
-                                     self.select_none_button, self.add_button))
-        preview_layout.addWidget(self.preview_table)
-        splitter.addWidget(preview_box)
-        queue_box = QWidget()
-        queue_layout = QVBoxLayout(queue_box)
-        queue_layout.setContentsMargins(0, 4, 0, 0)
-        self.queue_model = QueueModel()
-        self.queue_table = table(self.queue_model, 0)
-        self.queue_table.setColumnWidth(1, 139)
-        self.queue_table.setColumnWidth(2, 116)
-        self.queue_table.setColumnWidth(3, 92)
-        self.queue_table.setColumnWidth(4, 65)
-        self.queue_table.setColumnWidth(5, 230)
-        self.queue_table.setItemDelegateForColumn(2, ProgressDelegate(self.queue_table))
-        self.pause_all = button("Wstrzymaj kolejkę", lambda: self.c.pause_all(not self.c.paused))
-        self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
-        self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
-        self.retry_failed = button("Ponów nieudane", self.retry_failures)
-        self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
-        queue_layout.addWidget(row(QLabel("Kolejka"), None, self.pause_selected, self.resume_selected,
-                                   self.pause_all, self.retry_failed,
-                                   button("Wyczyść zakończone", self.clear_queue)))
-        queue_layout.addWidget(self.queue_table)
-        self.summary = QLabel()
-        self.total = QProgressBar()
-        self.total.setFormat("%p% · łączny postęp")
-        queue_layout.addWidget(self.summary)
-        queue_layout.addWidget(self.total)
-        splitter.addWidget(queue_box)
-        splitter.setSizes([270, 350])
-        layout.addWidget(splitter, 1)
-        return page
-
-    def settings_page(self):
-        settings = self.c.prefs
-        options = settings.options
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        media = QGroupBox("Pliki i jakość")
-        form = QFormLayout(media)
+class DownloadOptionsForm(QGroupBox):
+    def __init__(self, options):
+        super().__init__("Pliki i jakość")
+        form = QFormLayout(self)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.folder = QLineEdit(options.folder)
         self.template = QLineEdit(options.template)
         self.resolution = combo([("Najlepsza", 0), *((f"{p}p", p) for p in (2160, 1440, 1080, 720, 480))],
@@ -449,11 +308,224 @@ class Window(QMainWindow):
         form.addRow("Audio / format / bitrate", row(self.audio_only, self.audio_format, self.bitrate, None))
         form.addRow("Preferowany język audio", self.audio_lang)
         form.addRow("Napisy", row(self.subs, self.auto_subs, self.embed_subs, None))
-        form.addRow("Języki napisów, oddzielone przecinkiem", self.sub_lang)
+        form.addRow("Języki napisów", self.sub_lang)
+        self.sub_lang.setPlaceholderText("np. pl,en")
         form.addRow(row(self.metadata, self.thumbnail, None))
         form.addRow(row(self.keep_sidecars, None))
         form.addRow(row(self.force, None))
-        layout.addWidget(media)
+
+    def choose_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Wybierz folder", self.folder.text())
+        if path:
+            self.folder.setText(path)
+
+    def options(self):
+        return Options(
+            folder=self.folder.text().strip(), template=self.template.text().strip(),
+            resolution=self.resolution.currentData(), container=self.container.currentData(),
+            audio_only=self.audio_only.isChecked(), audio_format=self.audio_format.currentData(),
+            bitrate=self.bitrate.currentData(), audio_language=self.audio_lang.text().strip(),
+            subtitles=self.subs.isChecked(), auto_subtitles=self.auto_subs.isChecked(),
+            subtitle_languages=self.sub_lang.text().strip(), embed_subtitles=self.embed_subs.isChecked(),
+            thumbnail=self.thumbnail.isChecked(), metadata=self.metadata.isChecked(), force=self.force.isChecked(),
+            keep_sidecars=self.keep_sidecars.isChecked(),
+        )
+
+
+class PreviewOptionsDialog(QDialog):
+    def __init__(self, options, defaults, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Parametry bieżącego podglądu")
+        self.resize(670, 440)
+        self.options = None
+        self.defaults = defaults
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.form = DownloadOptionsForm(options)
+        self.scroll.setWidget(self.form)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.hide()
+        buttons = QDialogButtonBox()
+        buttons.addButton("Przywróć domyślne", QDialogButtonBox.ButtonRole.ResetRole).clicked.connect(self.reset)
+        buttons.addButton("Anuluj", QDialogButtonBox.ButtonRole.RejectRole)
+        apply = buttons.addButton("Zastosuj do podglądu", QDialogButtonBox.ButtonRole.AcceptRole)
+        apply.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.scroll, 1)
+        layout.addWidget(self.error)
+        layout.addWidget(buttons)
+
+    def reset(self):
+        self.form = DownloadOptionsForm(self.defaults)
+        self.scroll.setWidget(self.form)
+        self.error.hide()
+
+    def accept(self):
+        options = self.form.options()
+        try:
+            options.validate()
+        except ValueError as exc:
+            self.error.setText(str(exc))
+            self.error.show()
+            return
+        self.options = options
+        super().accept()
+
+
+class Window(QMainWindow):
+    def __init__(self, app, controller):
+        super().__init__()
+        self.app = app
+        self.c = controller
+        self.login_prompted = False
+        self.retry_preview = None
+        self.preview_options = None
+        self.preview_music = False
+        self.login_url = ""
+        self.quitting = False
+        self.setWindowTitle(APP_NAME)
+        screen = self.screen().availableGeometry()
+        self.resize(min(1140, screen.width() - 32), min(790, screen.height() - 64))
+        self.setMinimumSize(740, 460)
+        self.tabs = QTabWidget()
+        self.notice = QLabel("Przygotowywanie zależności…")
+        self.notice.setObjectName("muted")
+        self.notice.setWordWrap(True)
+        self.login = button("Zaloguj w przeglądarce", self.open_login)
+        self.retry_login = button("Zalogowano · ponów", self.retry_after_login)
+        self.login.hide()
+        self.retry_login.hide()
+        self.engine_label = QLabel()
+        self.engine_label.setObjectName("muted")
+        brand = QLabel(APP_NAME)
+        brand.setObjectName("brand")
+        center = QWidget()
+        self.setCentralWidget(center)
+        layout = QVBoxLayout(center)
+        layout.setContentsMargins(20, 14, 20, 14)
+        layout.setSpacing(11)
+        layout.addWidget(row(brand, None, self.engine_label))
+        layout.addWidget(self.tabs, 1)
+        layout.addWidget(row(self.notice, None, self.login, self.retry_login))
+        self.preview_tab = self.preview_page()
+        self.queue_tab = self.queue_page()
+        self.settings_tab = self.settings_page()
+        self.history_tab = self.history_page()
+        self.updates_tab = self.updates_page()
+        self.subscriptions_tab = self.subscriptions_page()
+        self.tabs.addTab(self.preview_tab, "Podgląd")
+        self.tabs.addTab(self.queue_tab, "Kolejka")
+        self.tabs.addTab(self.settings_tab, "Ustawienia")
+        self.tabs.addTab(self.history_tab, "Historia pobrań")
+        self.tabs.addTab(self.updates_tab, "Aktualizacje")
+        self.tabs.addTab(self.subscriptions_tab, "Subskrypcje")
+        self.tabs.currentChanged.connect(lambda _: self.refresh())
+        self.tray = QSystemTrayIcon(app.windowIcon(), self)
+        menu = QMenu(self)
+        menu.addAction("Pokaż YT Downloader", self.showNormal)
+        menu.addAction("Wstrzymaj / wznów kolejkę", lambda: self.c.pause_all(not self.c.paused))
+        menu.addAction("Zakończ", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self.showNormal()
+                                    if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.setToolTip(APP_NAME)
+        self.tray.setVisible(self.c.prefs.tray and QSystemTrayIcon.isSystemTrayAvailable())
+        self.c.changed.connect(self.refresh)
+        self.c.progress.connect(self.on_progress)
+        self.c.message.connect(self.notify)
+        self.c.scanned.connect(self.on_scan)
+        self.c.scan_entries.connect(self.on_scan_entries)
+        self.c.login_needed.connect(self.login_needed)
+        self.c.update_ready.connect(self.apply_app_update)
+        self.refresh()
+
+    def preview_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.source = QLineEdit()
+        self.source.setPlaceholderText("Wklej link z YouTube lub YouTube Music")
+        self.source_kind = QLabel()
+        self.source_kind.setObjectName("muted")
+        self.source.textChanged.connect(self.detect)
+        self.source.returnPressed.connect(self.preview)
+        self.preview_button = button("Pokaż podgląd", self.preview, primary=True)
+        self.cancel_button = button("Anuluj odczyt", self.c.cancel_scan)
+        self.cancel_button.hide()
+        source_row = row(self.source, self.source_kind, self.preview_button, self.cancel_button)
+        source_row.layout().setStretch(0, 1)
+        layout.addWidget(source_row)
+        self.channel_tabs = {key: checkbox(name, True) for key, name in TAB_NAMES.items()}
+        self.channel_row = row(*self.channel_tabs.values(), None)
+        self.channel_row.hide()
+        layout.addWidget(self.channel_row)
+        self.preview_model = PreviewModel()
+        self.preview_filter = QSortFilterProxyModel(self)
+        self.preview_filter.setSourceModel(self.preview_model)
+        self.preview_filter.setFilterKeyColumn(2)
+        self.preview_filter.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.preview_table = table(self.preview_filter, 2)
+        self.preview_table.setColumnWidth(0, 72)
+        self.preview_table.setColumnWidth(1, 44)
+        self.preview_table.setColumnWidth(4, 64)
+        self.preview_info = QLabel("Wklej link, aby odczytać listę.")
+        self.preview_info.setWordWrap(True)
+        self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
+        self.select_none_button = button("Odznacz wszystkie", lambda: self.select_visible(False))
+        self.add_button = button("Dodaj zaznaczone do kolejki", self.enqueue, primary=True)
+        self.preview_search = QLineEdit()
+        self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
+        self.preview_search.textChanged.connect(self.filter_preview)
+        self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
+        self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
+        self.preview_parameters = button("Parametry pobierania…", self.edit_preview_options)
+        self.preview_parameters.setEnabled(False)
+        self.preview_mode.setEnabled(False)
+        self.set_preview_selectable(False)
+        filter_row = row(self.preview_search, self.preview_mode, self.preview_parameters)
+        filter_row.layout().setStretch(0, 1)
+        layout.addWidget(filter_row)
+        layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button, self.add_button))
+        layout.addWidget(self.preview_table, 1)
+        return page
+
+    def queue_page(self):
+        page = QWidget()
+        queue_layout = QVBoxLayout(page)
+        self.queue_model = QueueModel()
+        self.queue_table = table(self.queue_model, 0)
+        self.queue_table.setColumnWidth(1, 139)
+        self.queue_table.setColumnWidth(2, 116)
+        self.queue_table.setColumnWidth(3, 92)
+        self.queue_table.setColumnWidth(4, 65)
+        self.queue_table.setColumnWidth(5, 230)
+        self.queue_table.setItemDelegateForColumn(2, ProgressDelegate(self.queue_table))
+        self.pause_all = button("Wstrzymaj kolejkę", lambda: self.c.pause_all(not self.c.paused))
+        self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
+        self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
+        self.retry_failed = button("Ponów nieudane", self.retry_failures)
+        self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
+        queue_layout.addWidget(row(self.pause_selected, self.resume_selected,
+                                   self.pause_all, self.retry_failed,
+                                   button("Wyczyść zakończone", self.clear_queue), None))
+        queue_layout.addWidget(self.queue_table, 1)
+        self.summary = QLabel()
+        self.total = QProgressBar()
+        self.total.setFormat("%p% · łączny postęp")
+        queue_layout.addWidget(self.summary)
+        queue_layout.addWidget(self.total)
+        return page
+
+    def settings_page(self):
+        settings = self.c.prefs
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.defaults_form = DownloadOptionsForm(settings.options)
+        layout.addWidget(self.defaults_form)
         behavior = QGroupBox("Aplikacja i logowanie")
         form = QFormLayout(behavior)
         self.parallel = QSpinBox()
@@ -486,11 +558,12 @@ class Window(QMainWindow):
     def history_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        self.history = TableModel(("Tytuł", "ID YouTube", "Pobrano", "Plik"))
+        self.history = TableModel(("Tytuł / źródło", "ID YouTube", "Data zapisu", "Plik"))
         view = table(self.history, 0)
         view.setColumnWidth(3, 420)
-        view.doubleClicked.connect(lambda index: self.open_path(Path(self.history.rows[index.row()][3]).parent))
-        layout.addWidget(row(None, button("Wyczyść historię", self.clear_history)))
+        view.doubleClicked.connect(self.open_history_folder)
+        layout.addWidget(row(button("Importuj archiwum yt-dlp…", self.import_history), None,
+                             button("Wyczyść historię", self.clear_history)))
         layout.addWidget(view)
         return page
 
@@ -550,7 +623,7 @@ class Window(QMainWindow):
             return
         self.start_preview(source, tabs)
 
-    def start_preview(self, source, tabs):
+    def start_preview(self, source, tabs, *, preserve_options=False):
         try:
             self.c.preview(source, tabs)
         except ValueError as exc:
@@ -566,8 +639,15 @@ class Window(QMainWindow):
         self.preview_info.setToolTip("")
         self.preview_model.set_entries([])
         self.preview_search.clear()
-        self.preview_mode.setCurrentIndex(1 if source.music else 0)
+        self.preview_music = source.music
+        if not preserve_options:
+            self.preview_options = None
+            self.preview_mode.setCurrentIndex(1 if source.music else 0)
+            self.preview_parameters.setText("Parametry pobierania…")
+        self.preview_mode.setEnabled(True)
+        self.preview_parameters.setEnabled(True)
         self.set_preview_selectable(False)
+        self.tabs.setCurrentWidget(self.preview_tab)
 
     def set_preview_selectable(self, enabled):
         self.preview_model.set_checkable(enabled)
@@ -622,11 +702,29 @@ class Window(QMainWindow):
             self.preview_info.setText(result.get("message", "Nie udało się odczytać listy."))
         self.retry_preview = result["login_retry"]
 
-    def enqueue(self):
-        options = self.c.prefs.options
+    def options_for_preview(self):
+        defaults = self.c.prefs.options
+        options = self.preview_options or defaults
         mode = self.preview_mode.currentData()
-        if mode is not None:
-            options = replace(options, audio_only=mode)
+        return replace(options, audio_only=defaults.audio_only if mode is None else mode)
+
+    def edit_preview_options(self):
+        defaults = self.c.prefs.options
+        if self.preview_music:
+            defaults = replace(defaults, audio_only=True)
+        dialog = PreviewOptionsDialog(self.options_for_preview(), defaults, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.preview_options = dialog.options if dialog.options != defaults else None
+            if self.preview_options is None:
+                self.preview_mode.setCurrentIndex(1 if self.preview_music else 0)
+                self.preview_parameters.setText("Parametry pobierania…")
+            else:
+                self.preview_mode.setCurrentIndex(self.preview_mode.findData(dialog.options.audio_only))
+                self.preview_parameters.setText("Zmienione parametry…")
+        dialog.deleteLater()
+
+    def enqueue(self):
+        options = self.options_for_preview()
         try:
             options.validate()
         except ValueError as exc:
@@ -635,6 +733,7 @@ class Window(QMainWindow):
         selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
         if selected:
             count = self.c.store.enqueue((self.preview_model.entries[i] for i in selected), options)
+            self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
             self.notify(f"Dodano pozycji: {count}.")
             self.refresh()
@@ -668,22 +767,29 @@ class Window(QMainWindow):
             self.c.store.clear_history()
             self.refresh()
 
-    def choose_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Wybierz folder", self.folder.text())
+    def open_history_folder(self, index):
+        path = self.history.rows[index.row()][3]
         if path:
-            self.folder.setText(path)
+            self.open_path(Path(path).parent)
+
+    def import_history(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Importuj archiwum yt-dlp", "",
+                                              "Pliki tekstowe (*.txt);;Wszystkie pliki (*)")
+        if not path:
+            return
+        try:
+            with Path(path).open(encoding="utf-8-sig") as archive:
+                added, known, ignored = self.c.store.import_archive(archive)
+        except (OSError, UnicodeError) as exc:
+            LOG.info("Import archiwum pobrań: %s", exc)
+            self.notify("Nie można odczytać archiwum. Wybierz plik tekstowy yt-dlp w kodowaniu UTF-8.")
+            return
+        self.c.store.skip_downloaded()
+        self.refresh()
+        self.notify(f"Zaimportowano {added} identyfikatorów · już w historii: {known} · nierozpoznane wiersze: {ignored}.")
 
     def save_settings(self):
-        options = Options(
-            folder=self.folder.text().strip(), template=self.template.text().strip(),
-            resolution=self.resolution.currentData(), container=self.container.currentData(),
-            audio_only=self.audio_only.isChecked(), audio_format=self.audio_format.currentData(),
-            bitrate=self.bitrate.currentData(), audio_language=self.audio_lang.text().strip(),
-            subtitles=self.subs.isChecked(), auto_subtitles=self.auto_subs.isChecked(),
-            subtitle_languages=self.sub_lang.text().strip(), embed_subtitles=self.embed_subs.isChecked(),
-            thumbnail=self.thumbnail.isChecked(), metadata=self.metadata.isChecked(), force=self.force.isChecked(),
-            keep_sidecars=self.keep_sidecars.isChecked(),
-        )
+        options = self.defaults_form.options()
         try:
             options.validate()
             if self.run_at_login.isChecked() != self.c.prefs.autostart or (
@@ -751,16 +857,17 @@ class Window(QMainWindow):
 
     def retry_after_login(self):
         if not self.c.prefs.browser and not (self.c.root / "cookies.dpapi").is_file():
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self.settings_tab)
             self.notify("Wybierz przeglądarkę w ustawieniach i zapisz wybór albo zaimportuj ciasteczka.")
             return
-        self.tabs.setCurrentIndex(0)
         if self.retry_preview:
             source, tabs = self.retry_preview
             self.source.setText(source.url)
             for tab, check in self.channel_tabs.items():
                 check.setChecked(tab in tabs)
-            self.start_preview(source, tabs)
+            self.start_preview(source, tabs, preserve_options=True)
+        else:
+            self.tabs.setCurrentWidget(self.queue_tab)
         self.c.retry_auth()
 
     def refresh_login_actions(self):
@@ -805,14 +912,14 @@ class Window(QMainWindow):
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))
         self.selection_state()
         self.update_summary()
-        page = self.tabs.currentIndex()
-        if page == 2:
-            self.history.replace([(r["title"], r["id"], stamp(r["time"]), r["path"])
+        page = self.tabs.currentWidget()
+        if page is self.history_tab:
+            self.history.replace([(r["title"] or "Z archiwum yt-dlp", r["id"], stamp(r["time"]), r["path"])
                                   for r in self.c.store.history()])
-        elif page == 3:
+        elif page is self.updates_tab:
             self.updates.replace([(stamp(r["time"]), r["component"], r["version"], r["status"], r["detail"])
                                   for r in self.c.store.update_history()])
-        elif page == 4:
+        elif page is self.subscriptions_tab:
             self.subscriptions.replace([(r["url"] + (" · YouTube Music" if r["music"] else ""),
                                          ", ".join(TAB_NAMES[t] for t in json.loads(r["tabs"])), str(r["hours"]),
                                          "Wymaga logowania" if r["needs_login"]

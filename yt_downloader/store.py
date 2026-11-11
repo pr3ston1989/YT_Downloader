@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .model import Entry, Options, Preferences
+from .model import Entry, Options, Preferences, VIDEO_ID
 
 
 @dataclass(frozen=True)
@@ -155,6 +155,25 @@ class Store:
 
     def history(self):
         return self.db.execute("SELECT * FROM downloads ORDER BY time DESC").fetchall()
+
+    def import_archive(self, lines):
+        ids = []
+        ignored = 0
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) == 2 and fields[0].lower() == "youtube" and VIDEO_ID.fullmatch(fields[1]):
+                ids.append(fields[1])
+            else:
+                ignored += 1
+        imported_at = time.time()
+        with self.db:
+            added = self.db.executemany("""
+                INSERT INTO downloads (id,title,path,time) VALUES (?,'','',?) ON CONFLICT(id) DO NOTHING
+            """, ((video_id, imported_at) for video_id in ids)).rowcount
+        return added, len(ids) - added, ignored
 
     def clear_history(self):
         with self.db:

@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, parse_source
-from yt_downloader.ui import Window
+from yt_downloader.ui import PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
 from yt_downloader.worker import load_engine, scan
 
@@ -175,6 +175,87 @@ class PaginationPreviewTests(unittest.TestCase):
         self.window.enqueue()
         self.assertTrue(all(job.options.audio_only for job in self.controller.store.jobs()))
         self.assertFalse(self.controller.prefs.options.audio_only)
+
+    def test_batches_from_the_same_preview_keep_their_own_parameters(self):
+        self.send_page(1, 4, {"kind": "done"})
+        defaults = self.controller.prefs.options
+
+        def customize(dialog):
+            dialog.form.resolution.setCurrentIndex(dialog.form.resolution.findData(480))
+            dialog.form.container.setCurrentIndex(dialog.form.container.findData("mkv"))
+            dialog.form.subs.setChecked(True)
+            dialog.form.sub_lang.setText("en")
+            dialog.form.embed_subs.setChecked(True)
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(PreviewOptionsDialog, "exec", customize):
+            self.window.preview_parameters.click()
+        self.window.preview_search.setText("film 1")
+        self.window.add_button.click()
+
+        def reset(dialog):
+            dialog.reset()
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(PreviewOptionsDialog, "exec", reset):
+            self.window.preview_parameters.click()
+        self.window.preview_search.clear()
+        self.window.add_button.click()
+
+        first, *remaining = self.controller.store.jobs()
+        self.assertEqual(first.options.resolution, 480)
+        self.assertEqual(first.options.container, "mkv")
+        self.assertTrue(first.options.subtitles and first.options.embed_subtitles)
+        self.assertEqual(first.options.subtitle_languages, "en")
+        self.assertEqual([job.options for job in remaining], [defaults, defaults])
+        self.assertEqual(self.controller.prefs.options, defaults)
+        with patch.object(PreviewOptionsDialog, "exec", return_value=QDialog.DialogCode.Rejected):
+            self.window.preview_parameters.click()
+        self.assertEqual(self.window.options_for_preview(), defaults)
+
+    def test_small_preview_window_gives_the_table_its_own_tab(self):
+        self.send_page(1, 21, {"kind": "done"})
+        self.window.resize(800, 500)
+        self.window.show()
+        self.addCleanup(self.window.hide)
+        self.app.processEvents()
+        self.assertEqual(self.window.height(), 500)
+        self.assertIs(self.window.tabs.currentWidget(), self.window.preview_tab)
+        self.assertFalse(self.window.queue_table.isVisible())
+        table = self.window.preview_table
+        self.assertGreaterEqual(table.rowAt(table.viewport().height() - 1), 7)
+
+    def test_imported_archive_skips_a_playlist_entry_and_preserves_force(self):
+        archive = self.controller.root / "pobrane.txt"
+        archive.write_text(f"youtube {entry(1).id}\nyoutube {entry(1).id}\nniepoprawny wiersz\n",
+                           encoding="utf-8-sig")
+        self.window.tabs.setCurrentWidget(self.window.history_tab)
+        with patch("yt_downloader.ui.QFileDialog.getOpenFileName", return_value=(str(archive), "")):
+            self.window.import_history()
+        self.assertEqual(self.window.history.rows[0][:2], ("Z archiwum yt-dlp", entry(1).id))
+        self.assertIn("już w historii: 1", self.window.notice.text())
+        self.assertIn("nierozpoznane wiersze: 1", self.window.notice.text())
+
+        self.window.tabs.setCurrentWidget(self.window.preview_tab)
+        self.send_page(1, 3, {"kind": "done"})
+        self.window.add_button.click()
+        self.assertEqual([job.state for job in self.controller.store.jobs()], ["skipped", "queued"])
+
+        def force_download(dialog):
+            dialog.form.force.setChecked(True)
+            dialog.accept()
+            return dialog.result()
+
+        self.window.preview_search.setText("film 1")
+        self.window.select_visible(True)
+        with patch.object(PreviewOptionsDialog, "exec", force_download):
+            self.window.preview_parameters.click()
+        self.window.add_button.click()
+        job = self.controller.store.jobs()[-1]
+        self.assertEqual(job.state, "queued")
+        self.assertTrue(job.options.force)
 
 
 if __name__ == "__main__":

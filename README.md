@@ -17,6 +17,10 @@ Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę o
 
 Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kolejki do widocznych wierszy. Po wyczyszczeniu filtra zobaczysz ponownie całą listę.
 
+**Podgląd** i **Kolejka** mają osobne karty. W podglądzie przycisk **Parametry pobierania…** pozwala wybrać m.in. format, jakość, język audio, napisy i folder dla dodawanych pozycji. Możesz dodać część listy z jednymi parametrami, a następnie zmienić je i dodać pozostałe. Nowy podgląd wraca do ustawień domyślnych.
+
+W karcie **Historia pobrań** kliknij **Importuj archiwum yt-dlp…**, aby wczytać plik tekstowy z wierszami `youtube ID_FILMU`. Znane identyfikatory są pomijane przy dodawaniu materiałów do kolejki i przez subskrypcje. Aby pobrać materiał ponownie, zaznacz **Pobieraj ponownie filmy z historii** w parametrach podglądu.
+
 ## YouTube Music
 
 Wklej link do utworu, playlisty albo albumu YouTube Music. Album możesz wkleić jako link do strony `browse/MPRE…` albo do listy `OLAK5uy_…`. Link do wykonawcy otwiera podgląd zakładek jego kanału YouTube. Jeśli kanał typu Topic nie ma zakładki Filmy, aplikacja spróbuje odczytać jego listę przesłanych materiałów. Link do utworu z automatycznym miksem w tle otwiera sam utwór.
