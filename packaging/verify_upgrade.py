@@ -2,6 +2,7 @@
 
 from contextlib import closing
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -60,10 +61,17 @@ def verify(previous, expected):
     original = sha256(executable)
     root = data / "YTDownloader"
     saved = Entry("jNQXAC9IVRw", "Paused upgrade fixture")
+    options = Options(folder=str(scratch / "downloads"))
     with closing(Store(root)) as store:
         store.set("queue_paused", True)
-        store.enqueue([saved], Options(folder=str(scratch / "downloads")))
-        store.state(store.jobs()[0].id, "paused")
+        store.enqueue([saved], options)
+        job_id = store.jobs()[0].id
+        # Seed the fields the old executable knows before it starts the upgrade.
+        with store.db:
+            store.db.execute("UPDATE jobs SET entry=?, options=? WHERE id=?",
+                             (json.dumps({"id": saved.id, "title": saved.title}),
+                              json.dumps({"folder": options.folder}), job_id))
+        store.state(job_id, "paused")
     # Model a launch from Explorer rather than inheriting the runner's PowerShell 7 module paths.
     env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
     env.update(LOCALAPPDATA=str(data), QT_QPA_PLATFORM="offscreen")
@@ -79,7 +87,7 @@ def verify(previous, expected):
                 with closing(Store(root)) as store:
                     jobs = store.jobs()
                     if not (store.get("queue_paused") and len(jobs) == 1
-                            and jobs[0].entry == saved and jobs[0].state == "paused"):
+                            and jobs[0].entry == saved and jobs[0].options == options and jobs[0].state == "paused"):
                         raise RuntimeError("The update did not preserve the paused queue.")
                 print(f"Verified automatic upgrade, restart and queue preservation from {previous} to {expected}.")
                 return

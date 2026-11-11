@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -134,6 +135,15 @@ def base_parameters(request, logger):
     return result
 
 
+def publication_time(info):
+    if isinstance(info.get("timestamp"), (int, float)):
+        return info["timestamp"]
+    try:
+        return datetime.strptime(info.get("upload_date") or "", "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def scan(ydl, request, parameters, emit):
     source = request["source"]
     single = source["kind"] == "video"
@@ -153,7 +163,8 @@ def scan(ydl, request, parameters, emit):
         settings.update(
             extractor_retries=3,
             retry_sleep_functions={"extractor": lambda n: min(2 ** n, 8)},
-            extractor_args={"youtube": {"raise_incomplete_data": ["1"]}},
+            extractor_args={"youtube": {"raise_incomplete_data": ["1"]},
+                            "youtubetab": {"approximate_date": ["1"]}},
         )
     count = 0
     last_error = None
@@ -194,6 +205,7 @@ def scan(ydl, request, parameters, emit):
                         channel=(owner or "YouTube Music") if album_source else channel or owner,
                         playlist=collection or album, index=number, duration=entry.get("duration"),
                         tab=tab, music=music, album=album, track_number=track_number,
+                        published_at=publication_time(entry),
                     )
                     emit("entry", entry=asdict(item))
                     count += 1

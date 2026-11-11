@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from io import BytesIO
 import os
 from pathlib import Path
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
-from yt_downloader.model import Entry, parse_source
+from yt_downloader.model import Entry, detect_episode_numbers, output_stem, parse_source
 from yt_downloader.ui import PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
 from yt_downloader.worker import load_engine, scan
@@ -24,6 +24,11 @@ def entry(number):
 
 
 class PaginationWorkerTests(unittest.TestCase):
+    def test_episode_detection_rejects_years_and_isolated_numbers(self):
+        entries = [Entry(entry(i).id, title) for i, title in enumerate((
+            "Podsumowanie | 2023", "Koncert 2024", "Zapowiedź #4", "Dokument (2025)", "Powrót 1999"), 1)]
+        self.assertEqual(detect_episode_numbers(entries), {})
+
     def test_continuations_are_consumed_incrementally_and_keep_original_order(self):
         events = []
 
@@ -31,7 +36,7 @@ class PaginationWorkerTests(unittest.TestCase):
             for first, end in [(1, 101), (101, 201), (201, 351)]:
                 self.assertEqual(len(events), first - 1)
                 for number in range(first, end):
-                    yield {"id": entry(number).id, "title": f"Film {number}"}
+                    yield {"id": entry(number).id, "title": f"Film {number}", "timestamp": number * 1000}
 
         client = MagicMock()
         client.extract_info.return_value = {"_type": "playlist", "entries": pages(),
@@ -46,9 +51,11 @@ class PaginationWorkerTests(unittest.TestCase):
         self.assertEqual(settings["extractor_retries"], 3)
         self.assertEqual(settings["retry_sleep_functions"]["extractor"](n=2), 4)
         self.assertEqual(settings["extractor_args"]["youtube"]["raise_incomplete_data"], ["1"])
+        self.assertEqual(settings["extractor_args"]["youtubetab"]["approximate_date"], ["1"])
         self.assertEqual([values["entry"]["index"] for kind, values in events if kind == "entry"],
                          list(range(1, 351)))
         self.assertEqual(events[-1], ("done", {"count": 350}))
+        self.assertEqual(events[-2][1]["entry"]["published_at"], 350000)
 
 
 class PaginationEngineTests(unittest.TestCase):
@@ -225,7 +232,9 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertIs(self.window.tabs.currentWidget(), self.window.preview_tab)
         self.assertFalse(self.window.queue_table.isVisible())
         table = self.window.preview_table
-        self.assertGreaterEqual(table.rowAt(table.viewport().height() - 1), 7)
+        visible = sum(table.visualRect(table.model().index(row, 0)).intersects(table.viewport().rect())
+                      for row in range(table.model().rowCount()))
+        self.assertGreaterEqual(visible, 8)
 
     def test_imported_archive_skips_a_playlist_entry_and_preserves_force(self):
         archive = self.controller.root / "pobrane.txt"
@@ -256,6 +265,56 @@ class PaginationPreviewTests(unittest.TestCase):
         job = self.controller.store.jobs()[-1]
         self.assertEqual(job.state, "queued")
         self.assertTrue(job.options.force)
+
+    def test_chronological_order_keeps_selection_and_uses_positions_in_the_file_names(self):
+        self.worker.poll.return_value = 0
+        self.worker.events.return_value = [
+            {"kind": "entry", "entry": asdict(replace(entry(number), published_at=date))}
+            for number, date in enumerate((300, None, 100, 200), 1)
+        ] + [{"kind": "done"}]
+        self.controller.poll_scan()
+        self.window.preview_model.select_rows([0], False)
+        order = self.window.preview_order
+        order.setCurrentIndex(order.findData("oldest"))
+        self.assertEqual(list(self.window.visible_rows()), [2, 3, 0, 1])
+        self.assertIn("Pozycje bez daty (1)", self.window.notice.text())
+        order.setCurrentIndex(order.findData("newest"))
+        self.assertEqual(list(self.window.visible_rows()), [0, 3, 2, 1])
+        order.setCurrentIndex(order.findData("oldest"))
+        self.window.add_button.click()
+        jobs = self.controller.store.jobs()
+        self.assertEqual([job.entry.title for job in jobs], ["Film 3", "Film 4", "Film 2"])
+        self.assertEqual([job.entry.index for job in jobs], [1, 2, 4])
+        self.assertTrue(output_stem(jobs[0].entry, jobs[0].options, jobs[0].id).name.startswith("01 - Film 3"))
+
+    def test_reverse_order_preserves_numbers_after_filtering(self):
+        self.send_page(1, 102, {"kind": "done"})
+        order = self.window.preview_order
+        order.setCurrentIndex(order.findData("reverse"))
+        self.assertEqual(list(self.window.visible_rows()), list(range(100, -1, -1)))
+        self.window.preview_search.setText("Film 100")
+        self.window.add_button.click()
+        job, = self.controller.store.jobs()
+        self.assertEqual(job.entry.index, 2)
+        self.assertTrue(output_stem(job.entry, job.options, job.id).name.startswith("002 - Film 100"))
+
+    def test_episode_order_uses_recognized_numbers_anywhere_in_titles(self):
+        titles = ["Sprawa na wybrzeżu | 451.", "Odc. 45 — Nowy trop", "Materiał specjalny",
+                  "Inny trop #104 Kryminatorium", "Dalsza historia | 284. VIDEO PODCAST",
+                  "S02E07 Gość sezonu", "Raport (2025)"]
+        self.worker.poll.return_value = 0
+        self.worker.events.return_value = [
+            {"kind": "entry", "entry": asdict(replace(entry(number), title=title))}
+            for number, title in enumerate(titles, 1)
+        ] + [{"kind": "done"}]
+        self.controller.poll_scan()
+        self.assertEqual(self.window.preview_order.currentData(), "episode")
+        self.window.add_button.click()
+        jobs = self.controller.store.jobs()
+        self.assertEqual([job.entry.title for job in jobs], [titles[i] for i in (1, 3, 4, 0, 5, 2, 6)])
+        self.assertEqual([job.entry.index_label for job in jobs],
+                         ["045", "104", "284", "451", "S02E007", "Bez numeru 001", "Bez numeru 002"])
+        self.assertTrue(output_stem(jobs[3].entry, jobs[3].options, jobs[3].id).name.startswith("451 - "))
 
 
 if __name__ == "__main__":

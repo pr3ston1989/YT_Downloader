@@ -12,6 +12,15 @@ FIELDS = {"channel", "playlist", "index", "title", "id", "ext"}
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 CHANNEL_TABS = ("videos", "shorts", "streams")
 TERMINAL = ("done", "skipped", "failed")
+SEASON_EPISODE = re.compile(r"(?<!\w)S([0-9]{1,2})\s*E([0-9]{1,4})(?!\w)", re.IGNORECASE)
+MARKED_EPISODE = re.compile(
+    r"(?:(?<!\w)(?:odcinek|odc\.?|episode|ep\.?)\s*[:#-]?\s*|(?<!\w)#\s*)"
+    r"([0-9]{1,4})(?!\w|[.,][0-9])", re.IGNORECASE)
+STRUCTURED_EPISODE = re.compile(
+    r"^([0-9]{1,4})(?:\.\s+|\s+[-–—|]\s+)|"
+    r"(?:[|–—]\s*|\s-\s+)([0-9]{1,4})\s*\.?(?:\s+(?:(?:video|wideo)\s+)?podcast)?\s*$|"
+    r"[\[(]([0-9]{1,4})[\])]\s*$", re.IGNORECASE)
+TRAILING_NUMBER = re.compile(r"\s([0-9]{1,4})\.?\s*$")
 
 
 @dataclass(frozen=True)
@@ -90,11 +99,44 @@ class Entry:
     music: bool = False
     album: str = ""
     track_number: int | None = None
+    published_at: float | None = None
+    index_label: str = ""
 
     @property
     def url(self):
         host = "music.youtube.com" if self.music else "www.youtube.com"
         return f"https://{host}/watch?v={self.id}"
+
+
+def detect_episode_numbers(entries):
+    marked, structured, trailing = {}, {}, {}
+    for row, entry in enumerate(entries):
+        title = entry.title.strip()
+        if match := SEASON_EPISODE.search(title):
+            marked[row] = (int(match[1]), int(match[2]))
+        elif match := MARKED_EPISODE.search(title):
+            marked[row] = (0, int(match[1]))
+        elif match := STRUCTURED_EPISODE.search(title):
+            number = int(next(group for group in match.groups() if group))
+            if not 1900 <= number <= 2099:
+                structured[row] = (0, number)
+        elif match := TRAILING_NUMBER.search(title):
+            number = int(match[1])
+            if not 1900 <= number <= 2099:
+                trailing[row] = (0, number)
+
+    numbers = marked | structured
+    distinct = len(set(numbers.values()))
+    if len(set(marked.values())) >= 2 and distinct * 4 >= len(entries):
+        return numbers
+    if distinct >= 3 and distinct * 2 >= len(entries):
+        return numbers
+    numbers.update(trailing)
+    sequence = sorted({number for season, number in numbers.values() if not season})
+    if len(sequence) >= 3 and len(sequence) * 3 >= len(entries) * 2:
+        if sequence[-1] - sequence[0] <= 3 * (len(sequence) - 1):
+            return numbers
+    return {}
 
 
 @dataclass
@@ -176,7 +218,7 @@ def output_stem(entry: Entry, options: Options, job_id: int) -> Path:
     values = {
         "channel": safe_segment(entry.channel or "YouTube", 60),
         "playlist": safe_segment(entry.playlist or ("Utwory" if entry.music else "Filmy"), 60),
-        "index": f"{entry.index:02d}",
+        "index": entry.index_label or f"{entry.index:02d}",
         "title": safe_segment(entry.title, 95),
         "id": entry.id,
     }

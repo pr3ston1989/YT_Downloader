@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
 from .controller import Controller, LABELS
-from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, parse_source
+from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, detect_episode_numbers, parse_source
 from .runtime import RESOURCES, atomic_bytes, command
 from .updates.application import restart_for
 
@@ -116,12 +116,18 @@ class PreviewModel(TableModel):
         super().__init__(("Pobierz", "Nr", "Tytuł", "Kanał", "Czas", "Zakładka"))
         self.selected = set()
         self.entries = []
+        self.positions = {}
+        self.number_labels = {}
+        self.episode_numbers = {}
         self.checkable = True
 
     def set_entries(self, entries):
         self.beginResetModel()
         self.entries = []
         self.selected.clear()
+        self.positions.clear()
+        self.number_labels.clear()
+        self.episode_numbers.clear()
         self.rows = []
         self.endResetModel()
         self.append_entries(entries)
@@ -143,6 +149,44 @@ class PreviewModel(TableModel):
         if self.rows:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, 0), [CHECK])
 
+    def set_order(self, order):
+        rows = range(len(self.entries))
+        if order == "reverse":
+            rows = reversed(rows)
+        elif order in ("oldest", "newest"):
+            direction = 1 if order == "oldest" else -1
+
+            def date_key(row):
+                value = self.entries[row].published_at
+                return value is None, direction * (value or 0)
+
+            rows = sorted(rows, key=date_key)
+        elif order == "episode" and self.episode_numbers:
+            rows = sorted(rows, key=lambda row: (row not in self.episode_numbers,
+                                                  self.episode_numbers.get(row, (0, 0))))
+        self.positions = {row: position for position, row in enumerate(rows, 1)} if order != "source" else {}
+        self.number_labels = {}
+        if order == "episode" and self.episode_numbers:
+            width = max(2, len(str(max(number for _, number in self.episode_numbers.values()))))
+            unnumbered = 0
+            for row in self.positions:
+                if row in self.episode_numbers:
+                    season, number = self.episode_numbers[row]
+                    self.number_labels[row] = f"S{season:02d}E{number:0{width}d}" if season else f"{number:0{width}d}"
+                else:
+                    unnumbered += 1
+                    self.number_labels[row] = f"Bez numeru {unnumbered:0{width}d}"
+        if self.rows:
+            self.dataChanged.emit(self.index(0, 1), self.index(len(self.rows) - 1, 1), [DISPLAY, USER])
+
+    def entry_at(self, row):
+        entry = self.entries[row]
+        if row in self.positions:
+            position = self.positions[row]
+            width = max(2, len(str(len(self.entries))))
+            return replace(entry, index=position, index_label=self.number_labels.get(row, f"{position:0{width}d}"))
+        return entry
+
     def flags(self, index):
         flags = super().flags(index)
         return flags | Qt.ItemFlag.ItemIsUserCheckable if self.checkable and index.column() == 0 else flags
@@ -150,6 +194,12 @@ class PreviewModel(TableModel):
     def data(self, index, role=DISPLAY):
         if index.isValid() and index.column() == 0 and role == CHECK:
             return Qt.CheckState.Checked if index.row() in self.selected else Qt.CheckState.Unchecked
+        if index.isValid() and index.column() == 1 and index.row() in self.positions:
+            position = self.positions[index.row()]
+            if role == USER:
+                return position
+            if role in (DISPLAY, Qt.ItemDataRole.ToolTipRole):
+                return self.number_labels.get(index.row(), str(position))
         return super().data(index, role)
 
     def setData(self, index, value, role=CHECK):
@@ -350,13 +400,13 @@ class PreviewOptionsDialog(QDialog):
         buttons.addButton("Przywróć domyślne", QDialogButtonBox.ButtonRole.ResetRole).clicked.connect(self.reset)
         buttons.addButton("Anuluj", QDialogButtonBox.ButtonRole.RejectRole)
         apply = buttons.addButton("Zastosuj do podglądu", QDialogButtonBox.ButtonRole.AcceptRole)
-        apply.setDefault(True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(self.scroll, 1)
         layout.addWidget(self.error)
         layout.addWidget(buttons)
+        apply.setDefault(True)
 
     def reset(self):
         self.form = DownloadOptionsForm(self.defaults)
@@ -466,6 +516,7 @@ class Window(QMainWindow):
         self.preview_filter.setSourceModel(self.preview_model)
         self.preview_filter.setFilterKeyColumn(2)
         self.preview_filter.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.preview_filter.setSortRole(USER)
         self.preview_table = table(self.preview_filter, 2)
         self.preview_table.setColumnWidth(0, 72)
         self.preview_table.setColumnWidth(1, 44)
@@ -478,13 +529,20 @@ class Window(QMainWindow):
         self.preview_search = QLineEdit()
         self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
         self.preview_search.textChanged.connect(self.filter_preview)
+        self.preview_order = combo([("Kolejność źródła", "source"), ("Odwróć listę", "reverse"),
+                                    ("Od najstarszych", "oldest"), ("Od najnowszych", "newest"),
+                                    ("Według numeru odcinka", "episode")], "source")
+        self.preview_order.setToolTip("Kolejność w kolejce i numeracja plików. Daty z podglądu mogą być przybliżone.")
+        self.episode_order = self.preview_order.model().item(self.preview_order.findData("episode"))
+        self.episode_order.setEnabled(False)
+        self.preview_order.currentIndexChanged.connect(self.order_preview)
         self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
         self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
         self.preview_parameters = button("Parametry pobierania…", self.edit_preview_options)
         self.preview_parameters.setEnabled(False)
         self.preview_mode.setEnabled(False)
         self.set_preview_selectable(False)
-        filter_row = row(self.preview_search, self.preview_mode, self.preview_parameters)
+        filter_row = row(self.preview_search, self.preview_order, self.preview_mode, self.preview_parameters)
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
         layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button, self.add_button))
@@ -637,7 +695,9 @@ class Window(QMainWindow):
         self.cancel_button.show()
         self.preview_info.setText("Odczytywanie listy…")
         self.preview_info.setToolTip("")
+        self.preview_order.setCurrentIndex(0)
         self.preview_model.set_entries([])
+        self.episode_order.setEnabled(False)
         self.preview_search.clear()
         self.preview_music = source.music
         if not preserve_options:
@@ -651,7 +711,29 @@ class Window(QMainWindow):
 
     def set_preview_selectable(self, enabled):
         self.preview_model.set_checkable(enabled)
+        self.preview_order.setEnabled(enabled and len(self.preview_model.entries) > 1)
         self.refresh_preview_actions()
+
+    def order_preview(self):
+        order = self.preview_order.currentData()
+        self.preview_model.set_order(order)
+        self.preview_filter.sort(1 if self.preview_model.positions else -1)
+        number_header = self.preview_table.horizontalHeader()
+        number_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents
+                                           if order == "episode" else QHeaderView.ResizeMode.Interactive)
+        if order != "episode":
+            self.preview_table.setColumnWidth(1, 44)
+        if order in ("oldest", "newest"):
+            entries = self.preview_model.entries
+            missing = sum(entry.published_at is None for entry in entries)
+            if missing == len(entries):
+                self.notify("Brak dat publikacji. Jeśli lista zaczyna się od najnowszych, wybierz „Odwróć listę”.")
+            elif missing:
+                self.notify(f"Posortowano według dostępnych dat. Pozycje bez daty ({missing}) są na końcu.")
+            else:
+                self.notify("Posortowano według dat publikacji. Daty w podglądzie mogą być przybliżone.")
+        elif order == "episode":
+            self.notify(f"Wykryto numery w tytułach {len(self.preview_model.episode_numbers)} pozycji.")
 
     def filter_preview(self, text):
         active = bool(text.strip())
@@ -668,7 +750,7 @@ class Window(QMainWindow):
         self.add_button.setEnabled(enabled)
 
     def visible_rows(self):
-        if not self.preview_search.text().strip():
+        if not self.preview_search.text().strip() and not self.preview_model.positions:
             return range(len(self.preview_model.entries))
         return [self.preview_filter.mapToSource(self.preview_filter.index(row, 0)).row()
                 for row in range(self.preview_filter.rowCount())]
@@ -701,6 +783,11 @@ class Window(QMainWindow):
         else:
             self.preview_info.setText(result.get("message", "Nie udało się odczytać listy."))
         self.retry_preview = result["login_retry"]
+        self.preview_model.episode_numbers = detect_episode_numbers(entries)
+        detected = bool(self.preview_model.episode_numbers)
+        self.episode_order.setEnabled(detected)
+        if detected:
+            self.preview_order.setCurrentIndex(self.preview_order.findData("episode"))
 
     def options_for_preview(self):
         defaults = self.c.prefs.options
@@ -732,7 +819,7 @@ class Window(QMainWindow):
             return
         selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
         if selected:
-            count = self.c.store.enqueue((self.preview_model.entries[i] for i in selected), options)
+            count = self.c.store.enqueue((self.preview_model.entry_at(i) for i in selected), options)
             self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
             self.notify(f"Dodano pozycji: {count}.")

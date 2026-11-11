@@ -89,6 +89,14 @@ jobs:
         id: previous
         run: |
           $release = Invoke-RestMethod "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" -SkipHttpErrorCheck
+          if ($release.tag_name -eq $env:GITHUB_REF_NAME) {
+            $version = [Version]($env:GITHUB_REF_NAME.TrimStart('v'))
+            $release = (Invoke-RestMethod "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases?per_page=20") |
+              Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' -and
+                             [Version]($_.tag_name.TrimStart('v')) -lt $version } |
+              Sort-Object { [Version]($_.tag_name.TrimStart('v')) } -Descending |
+              Select-Object -First 1
+          }
           if ($release.tag_name -and $release.tag_name -ne $env:GITHUB_REF_NAME) {
             "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
           }
@@ -98,6 +106,15 @@ jobs:
         run: |
           $version = python -c "from yt_downloader import APP_VERSION; print(APP_VERSION)"
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match app version." }
+          $published = Invoke-RestMethod "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME" -SkipHttpErrorCheck
+          if ($published.tag_name -eq $env:GITHUB_REF_NAME -and -not $published.draft) {
+            if ($published.assets.name -notcontains 'YTDownloader-Setup.exe' -or
+                $published.assets.name -notcontains 'YTDownloader-Setup.exe.sha256') {
+              throw "The existing release is missing installer assets."
+            }
+            Write-Host "The release is already published."
+            return
+          }
           gh release create $env:GITHUB_REF_NAME dist/YTDownloader-Setup.exe dist/YTDownloader-Setup.exe.sha256 --verify-tag --generate-notes --latest
       - name: Verify automatic upgrade and restart
         if: steps.previous.outputs.tag != ''
