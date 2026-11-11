@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .model import Entry, Options, Preferences, VIDEO_ID
+from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, Preferences, VIDEO_ID
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,13 @@ class Store:
         for name in ("needs_login", "music"):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE subscriptions ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        if self.db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            with self.db:
+                self.db.execute("""
+                    UPDATE preferences SET value=json_set(value, '$.options.template', ?)
+                    WHERE key='settings' AND replace(json_extract(value, '$.options.template'), char(92), '/')=?
+                """, (DEFAULT_TEMPLATE, LEGACY_TEMPLATE))
+                self.db.execute("PRAGMA user_version = 1")
 
     def close(self):
         self.db.close()

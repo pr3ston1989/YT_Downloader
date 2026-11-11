@@ -57,6 +57,7 @@ class MusicTests(unittest.TestCase):
                          ("Artysta", "Live", "Live", 1))
         self.assertEqual((second.index, second.track_number), (2, 5))
         self.assertEqual(second.channel, first.channel)
+        self.assertEqual((first.source_name, second.source_name), ("Live", "Live"))
 
     def test_old_jobs_keep_the_standard_youtube_url(self):
         entry = Entry(**{"id": "jNQXAC9IVRw", "title": "Film"})

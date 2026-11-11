@@ -5,8 +5,9 @@ import sqlite3
 import tempfile
 import unittest
 
-from yt_downloader.model import Entry, Options, output_stem, parse_source
+from yt_downloader.model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, output_stem, parse_source
 from yt_downloader.store import Store
+from yt_downloader.worker import download_stem
 
 
 class QueueTests(unittest.TestCase):
@@ -46,12 +47,40 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.store.claim().auth_attempts, 1)
 
     def test_windows_path_is_safe_and_keeps_video_id(self):
-        entry = replace(self.entry, title='CON: ? <>', channel="NUL", playlist="..")
+        entry = replace(self.entry, title='CON: ? <>', source_name="NUL")
         path = output_stem(entry, self.options, 1)
         self.assertTrue(path.is_relative_to(self.root.resolve()))
-        self.assertEqual(path.parent.parent.name, "_NUL")
+        self.assertEqual(path.parent.name, "_NUL")
         self.assertIn(self.entry.id, path.name)
         self.assertNotIn("?", path.name)
+
+    def test_previous_default_is_migrated_once_and_custom_settings_are_preserved(self):
+        custom = "{channel}/Własne/{title}.{ext}"
+        for original, expected in ((LEGACY_TEMPLATE.replace("/", "\\"), DEFAULT_TEMPLATE), (custom, custom)):
+            with self.subTest(original=original):
+                root = self.root / str(original == custom)
+                with closing(Store(root)) as previous:
+                    previous.set("settings", {"options": {"template": original, "resolution": 480}})
+                    previous.db.execute("PRAGMA user_version = 0")
+                with closing(Store(root)) as migrated:
+                    self.assertEqual(migrated.preferences().options.template, expected)
+                    self.assertEqual(migrated.preferences().options.resolution, 480)
+                    migrated.set("settings", {"options": {"template": LEGACY_TEMPLATE}})
+                with closing(Store(root)) as reopened:
+                    self.assertEqual(reopened.preferences().options.template, LEGACY_TEMPLATE)
+
+    def test_saved_job_uses_the_source_folder_and_preserves_custom_templates(self):
+        options = replace(self.options, template=LEGACY_TEMPLATE)
+        items = [replace(self.entry, channel="Autor A", playlist="Moja playlista"),
+                 replace(self.entry, channel="Autor B", playlist="Moja playlista"),
+                 replace(self.entry, channel="Mój kanał", playlist="Mój kanał - Filmy", tab="videos")]
+        self.store.enqueue(items, options)
+        paths = [download_stem(job.entry, job.options, job.id, "mp4") for job in self.store.jobs()]
+        self.assertEqual([path.parent.relative_to(self.root).parts for path in paths],
+                         [("Moja playlista",), ("Moja playlista",), ("Mój kanał",)])
+        current = replace(items[0], source_name="Moja playlista")
+        self.assertEqual(download_stem(current, options, 1, "mp4").parent.relative_to(self.root).parts,
+                         ("Autor A", "Moja playlista"))
 
     def test_youtube_urls_are_normalized(self):
         self.assertEqual(parse_source("youtu.be/jNQXAC9IVRw").kind, "video")

@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import io
 import json
@@ -8,10 +8,15 @@ import re
 import sys
 import tempfile
 import time
+from urllib.parse import parse_qs, urlsplit
 
 from .auth import crypt
-from .model import Entry, Options, VIDEO_ID, output_stem
+from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, VIDEO_ID, output_stem
 from .runtime import atomic_json
+
+
+PARTIAL_FILE = re.compile(r"(?:f[\w+-]+\.)?[\w]+\.(?:part(?:-Frag\d+)?|ytdl)")
+SPLIT_STREAM = re.compile(r"f[\w+-]+\.[\w]+")
 
 
 def load_engine(path):
@@ -146,12 +151,16 @@ def publication_time(info):
 
 def scan(ydl, request, parameters, emit):
     source = request["source"]
-    single = source["kind"] == "video"
+    kind = source["kind"]
+    single = kind == "video"
     music = source.get("music", False)
-    album_source = source["kind"] == "album"
+    album_source = kind == "album"
     artist_channel = (re.fullmatch(r"https://www\.youtube\.com/channel/UC([A-Za-z0-9_-]{22})", source["url"])
                       if music else None)
-    tabs = request["tabs"] if source["kind"] == "channel" else [""]
+    tabs = request["tabs"] if kind == "channel" else [""]
+    url_parts = urlsplit(source["url"])
+    source_id = parse_qs(url_parts.query).get("list", [url_parts.path.rsplit("/", 1)[-1]])[0]
+    source_name = ""
     settings = {
         **parameters,
         "extract_flat": False if single else "in_playlist",
@@ -190,6 +199,13 @@ def scan(ydl, request, parameters, emit):
                 owner = info.get("channel") or info.get("uploader") or ""
                 if album_source:
                     collection = (info.get("album") or collection).removeprefix("Album - ")
+                if not source_name:
+                    if kind == "channel":
+                        source_name = owner or source_id
+                    elif single:
+                        source_name = owner or ("YouTube Music" if music else "YouTube")
+                    else:
+                        source_name = collection or source_id
                 entries = info.get("entries", (info,))
                 for index, entry in enumerate(() if entries is None else entries, 1):
                     video_id = entry.get("id") if entry else None
@@ -205,15 +221,15 @@ def scan(ydl, request, parameters, emit):
                         channel=(owner or "YouTube Music") if album_source else channel or owner,
                         playlist=collection or album, index=number, duration=entry.get("duration"),
                         tab=tab, music=music, album=album, track_number=track_number,
-                        published_at=publication_time(entry),
+                        published_at=publication_time(entry), source_name=source_name,
                     )
                     emit("entry", entry=asdict(item))
                     count += 1
         except Exception as exc:
-            if source["kind"] != "channel" or len(tabs) == 1:
+            if kind != "channel" or len(tabs) == 1:
                 raise
             last_error = exc
-            code, message = explain(exc, source_kind=source["kind"])
+            code, message = explain(exc, source_kind=kind)
             emit("scan_warning", tab=tab, code=code, message=message)
     if not count and last_error:
         raise last_error
@@ -295,8 +311,7 @@ def bind_partial_download(client, stem, marker, emit):
                 discarded = False
                 for path in stem.parent.iterdir():
                     suffix = path.name.removeprefix(prefix)
-                    if suffix != path.name and (suffix in intermediates or re.fullmatch(
-                            r"(?:f[\w+-]+\.)?[\w]+\.(?:part(?:-Frag\d+)?|ytdl)", suffix)):
+                    if suffix != path.name and (suffix in intermediates or PARTIAL_FILE.fullmatch(suffix)):
                         path.unlink()
                         discarded = True
                 if discarded:
@@ -308,15 +323,34 @@ def bind_partial_download(client, stem, marker, emit):
     client.format_selector = select
 
 
+def download_stem(entry: Entry, options: Options, job_id: int, extension: str) -> Path:
+    # Jobs queued before source names were recorded keep their previous path only
+    # when there is an existing download to finish at that path.
+    if entry.source_name or options.template.replace("\\", "/") != LEGACY_TEMPLATE:
+        return output_stem(entry, options, job_id)
+    old = output_stem(entry, options, job_id)
+    if old.parent.is_dir():
+        prefix = old.name + "."
+        for file in old.parent.iterdir():
+            if not file.name.startswith(prefix):
+                continue
+            suffix = file.name[len(prefix):]
+            existing = (suffix in (extension, "yt-resume.json") or PARTIAL_FILE.fullmatch(suffix)
+                        or SPLIT_STREAM.fullmatch(suffix))
+            if existing and file.is_file():
+                return old
+    return output_stem(entry, replace(options, template=DEFAULT_TEMPLATE), job_id)
+
+
 def download(ydl, request, parameters, emit):
     from yt_dlp.postprocessor import get_postprocessor
 
     entry = Entry(**request["entry"])
     options = Options(**request["options"])
     options.validate()
-    stem = output_stem(entry, options, request["job_id"])
-    stem.parent.mkdir(parents=True, exist_ok=True)
     extension = options.audio_format if options.audio_only else options.container
+    stem = download_stem(entry, options, request["job_id"], extension)
+    stem.parent.mkdir(parents=True, exist_ok=True)
     final = Path(f"{stem}.{extension}")
     marker = stem.with_name(stem.name + ".yt-resume.json")
     last_update = 0.0

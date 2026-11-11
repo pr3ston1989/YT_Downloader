@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
-from yt_downloader.model import Entry, detect_episode_numbers, output_stem, parse_source
+from yt_downloader.model import Entry, Options, detect_episode_numbers, output_stem, parse_source
 from yt_downloader.ui import PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
 from yt_downloader.worker import load_engine, scan
@@ -48,7 +48,8 @@ class PaginationWorkerTests(unittest.TestCase):
             for first, end in [(1, 101), (101, 201), (201, 351)]:
                 self.assertEqual(len(events), first - 1)
                 for number in range(first, end):
-                    yield {"id": entry(number).id, "title": f"Film {number}", "timestamp": number * 1000}
+                    yield {"id": entry(number).id, "title": f"Film {number}", "timestamp": number * 1000,
+                           "channel": f"Autor {number % 4}"}
 
         client = MagicMock()
         client.extract_info.return_value = {"_type": "playlist", "entries": pages(),
@@ -68,6 +69,30 @@ class PaginationWorkerTests(unittest.TestCase):
                          list(range(1, 351)))
         self.assertEqual(events[-1], ("done", {"count": 350}))
         self.assertEqual(events[-2][1]["entry"]["published_at"], 350000)
+        entries = [Entry(**values["entry"]) for kind, values in events if kind == "entry"]
+        self.assertEqual(len({item.channel for item in entries}), 4)
+        options = Options()
+        self.assertEqual({output_stem(item, options, 1).parent.name for item in entries}, {"Playlista"})
+
+    def test_channel_tabs_share_the_channel_folder(self):
+        client = MagicMock()
+        client.extract_info.side_effect = [
+            {"title": "Właściciel - Filmy", "channel": "Właściciel",
+             "entries": [{"id": entry(1).id, "channel": "Autor filmu"}]},
+            {"title": "Właściciel - Shorts", "entries": [{"id": entry(2).id, "channel": "Autor shorta"}]},
+            {"title": "Właściciel - Transmisje", "uploader": "Właściciel",
+             "entries": [{"id": entry(3).id, "channel": "Autor transmisji"}]},
+        ]
+        ydl = MagicMock()
+        ydl.return_value.__enter__.return_value = client
+        events = []
+        source = parse_source("https://www.youtube.com/@wlasciciel")
+        scan(ydl, {"source": asdict(source), "tabs": ["videos", "shorts", "streams"]}, {},
+             lambda kind, **values: events.append((kind, values)))
+        entries = [Entry(**values["entry"]) for kind, values in events if kind == "entry"]
+        self.assertEqual([item.tab for item in entries], ["videos", "shorts", "streams"])
+        self.assertEqual({item.source_name for item in entries}, {"Właściciel"})
+        self.assertEqual({output_stem(item, Options(), 1).parent.name for item in entries}, {"Właściciel"})
 
 
 class PaginationEngineTests(unittest.TestCase):

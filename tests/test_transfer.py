@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from yt_downloader import worker
-from yt_downloader.model import Entry, Options
+from yt_downloader.model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options
 from yt_downloader.process import Worker
 from yt_downloader.updates import EngineManager
 
@@ -84,16 +84,19 @@ class TransferTests(unittest.TestCase):
             command = lambda flag, work: [sys.executable, "-c", runner, str(script), str(work)]
             try:
                 with patch("yt_downloader.process.command", side_effect=command):
-                    for different in (False, True):
-                        with self.subTest(different=different):
-                            self.check_resume(root / str(different), runtime, server, different)
+                    for different, legacy in ((False, False), (True, False), (False, True)):
+                        with self.subTest(different=different, legacy=legacy):
+                            self.check_resume(root / f"{different}-{legacy}", runtime, server, different, legacy)
             finally:
                 server.shutdown()
 
-    def check_resume(self, root, runtime, server, different):
-        options = Options(folder=str(root / "downloads"), metadata=False, thumbnail=False)
-        request = {"operation": "download", "entry": asdict(Entry("jNQXAC9IVRw", "Resume fixture")),
+    def check_resume(self, root, runtime, server, different, legacy):
+        options = Options(folder=str(root / "downloads"), metadata=False, thumbnail=False,
+                          template=LEGACY_TEMPLATE if legacy else DEFAULT_TEMPLATE)
+        entry = Entry("jNQXAC9IVRw", "Resume fixture", "Autor", "Playlista", source_name="Playlista")
+        request = {"operation": "download", "entry": asdict(entry),
                    "options": asdict(options), "job_id": 1, "runtime": asdict(runtime), "cache": False}
+        folder = root / "downloads" / ("Autor/Playlista" if legacy else "Playlista")
 
         def launch(path, format_id):
             return Worker(root, {**request, "fixture": {
@@ -104,7 +107,7 @@ class TransferTests(unittest.TestCase):
         try:
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline and first.poll() is None:
-                part = next((root / "downloads").rglob("*.part"), None)
+                part = next(folder.glob("*.part"), None)
                 if part and part.stat().st_size >= 65536:
                     break
                 time.sleep(0.025)
@@ -115,12 +118,16 @@ class TransferTests(unittest.TestCase):
 
         start = len(server.offsets)
         path = "/second" if different else "/first"
+        if legacy:
+            # Model the persisted entry from before the new source folder field existed.
+            request["entry"].pop("source_name")
         resumed = launch(path, "22" if different else "18")
         try:
             resumed.process.wait(timeout=25)
             events = list(resumed.events())
             self.assertEqual(resumed.poll(), 0, events)
             result = next(Path(event["path"]) for event in events if event["kind"] == "done")
+            self.assertEqual(result.parent, folder)
             self.assertEqual(result.read_bytes(), server.payloads[path])
             self.assertFalse(list(result.parent.glob("*.yt-resume.json")))
             offsets = [offset for route, offset in server.offsets[start:] if route == path]

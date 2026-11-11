@@ -15,8 +15,9 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from yt_downloader.model import Entry, Options
+from yt_downloader.model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options
 from yt_downloader.store import Store
+from yt_downloader.updates.application import version_tuple
 
 
 def sha256(path):
@@ -62,8 +63,12 @@ def verify(previous, expected):
     root = data / "YTDownloader"
     saved = Entry("jNQXAC9IVRw", "Paused upgrade fixture")
     options = Options(folder=str(scratch / "downloads"))
+    legacy_template = version_tuple(previous) < (1, 1, 6)
     with closing(Store(root)) as store:
         store.set("queue_paused", True)
+        if legacy_template:
+            store.set("settings", {"options": {"template": LEGACY_TEMPLATE, "folder": options.folder}})
+            store.db.execute("PRAGMA user_version = 0")
         store.enqueue([saved], options)
         job_id = store.jobs()[0].id
         # Seed the fields the old executable knows before it starts the upgrade.
@@ -84,6 +89,14 @@ def verify(previous, expected):
             if any(version == expected and status == "zainstalowano" for version, status, _ in history):
                 if app.poll() != 0 or sha256(executable) == original:
                     raise RuntimeError("The prior process or executable was not replaced.")
+                if legacy_template:
+                    with closing(sqlite3.connect(root / "data.sqlite3")) as db:
+                        template, folder = db.execute("""
+                            SELECT json_extract(value, '$.options.template'), json_extract(value, '$.options.folder')
+                            FROM preferences WHERE key='settings'
+                        """).fetchone()
+                    if (template, folder) != (DEFAULT_TEMPLATE, options.folder):
+                        raise RuntimeError("The updated application did not migrate the default output template.")
                 with closing(Store(root)) as store:
                     jobs = store.jobs()
                     if not (store.get("queue_paused") and len(jobs) == 1

@@ -7,8 +7,9 @@ from urllib.parse import parse_qs, urlsplit
 
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "YTDownloader"
-DEFAULT_TEMPLATE = "{channel}/{playlist}/{index} - {title} [{id}].{ext}"
-FIELDS = {"channel", "playlist", "index", "title", "id", "ext"}
+LEGACY_TEMPLATE = "{channel}/{playlist}/{index} - {title} [{id}].{ext}"
+DEFAULT_TEMPLATE = "{source}/{index} - {title} [{id}].{ext}"
+FIELDS = {"source", "channel", "playlist", "index", "title", "id", "ext"}
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 CHANNEL_TABS = ("videos", "shorts", "streams")
 TERMINAL = ("done", "skipped", "failed")
@@ -101,6 +102,7 @@ class Entry:
     track_number: int | None = None
     published_at: float | None = None
     index_label: str = ""
+    source_name: str = ""
 
     @property
     def url(self):
@@ -205,7 +207,7 @@ def validate_template(template: str):
                 if name is not None and (name not in FIELDS or spec or conversion):
                     raise ValueError
     except ValueError:
-        raise ValueError("Użyj pól {channel}, {playlist}, {index}, {title}, {id}, {ext}.") from None
+        raise ValueError("Użyj pól {source}, {channel}, {playlist}, {index}, {title}, {id}, {ext}.") from None
 
 
 def safe_segment(value: str, limit: int = 100) -> str:
@@ -218,7 +220,9 @@ def safe_segment(value: str, limit: int = 100) -> str:
 
 
 def output_stem(entry: Entry, options: Options, job_id: int) -> Path:
+    saved_source = entry.channel if entry.tab and entry.channel else entry.playlist or entry.album or entry.channel
     values = {
+        "source": safe_segment(entry.source_name or saved_source or ("YouTube Music" if entry.music else "YouTube"), 80),
         "channel": safe_segment(entry.channel or "YouTube", 60),
         "playlist": safe_segment(entry.playlist or ("Utwory" if entry.music else "Filmy"), 60),
         "index": entry.index_label or f"{entry.index:02d}",

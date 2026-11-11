@@ -334,6 +334,7 @@ class DownloadOptionsForm(QGroupBox):
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.folder = QLineEdit(options.folder)
         self.template = QLineEdit(options.template)
+        self.template.setToolTip("{source} wstawia nazwę playlisty, albumu lub kanału otwartego w podglądzie.")
         self.resolution = combo([("Najlepsza", 0), *((f"{p}p", p) for p in (2160, 1440, 1080, 720, 480))],
                                 options.resolution)
         self.container = combo([(s.upper(), s) for s in ("mp4", "mkv")], options.container)
