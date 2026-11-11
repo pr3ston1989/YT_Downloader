@@ -41,6 +41,7 @@ class Scan:
     recovery: int = 0
     worker: Worker | None = None
     entries: list = field(default_factory=list)
+    previous_entries: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     outcome: dict = field(default_factory=dict)
 
@@ -49,7 +50,7 @@ class Controller(QObject):
     changed = Signal()
     progress = Signal(int, object)
     scanned = Signal(object)
-    scan_progress = Signal(int)
+    scan_entries = Signal(int, object)
     message = Signal(str)
     login_needed = Signal(str, str, bool)
     update_ready = Signal(object)
@@ -188,7 +189,9 @@ class Controller(QObject):
     def start_scan_worker(self):
         scan = self.scan
         try:
-            scan.entries.clear()
+            if len(scan.entries) > len(scan.previous_entries):
+                scan.previous_entries = scan.entries
+            scan.entries = []
             scan.warnings.clear()
             scan.outcome = {}
             scan.worker = Worker(self.root / "workers", self.request(
@@ -198,11 +201,13 @@ class Controller(QObject):
             self.finish_scan({"kind": "error", "message": "Nie udało się uruchomić odczytu listy."})
 
     def cancel_scan(self):
-        scan, self.scan = self.scan, None
+        scan = self.scan
+        if not scan:
+            return
         self.pending_repairs.pop(None, None)
-        if scan and scan.worker:
+        if scan.worker:
             scan.worker.close()
-        self.scanned.emit({"cancelled": True})
+        self.finish_scan({"kind": "cancelled", "message": "Odczyt anulowany."})
 
     def poll_scan(self):
         scan = self.scan
@@ -222,7 +227,7 @@ class Controller(QObject):
             else:
                 scan.outcome = event
         if len(scan.entries) != size and not scan.subscription:
-            self.scan_progress.emit(len(scan.entries))
+            self.scan_entries.emit(size, scan.entries[size:])
         if finished:
             worker.close()
             scan.worker = None
@@ -239,10 +244,14 @@ class Controller(QObject):
         if event.get("detail"):
             LOG.warning("Odczyt listy / %s", event["detail"])
         successful = event["kind"] == "done"
+        complete = successful and not scan.warnings
+        entries = scan.entries
+        if not complete and len(scan.previous_entries) > len(entries):
+            entries = scan.previous_entries
         code = event.get("code")
         if scan.subscription:
             row = scan.subscription
-            self.store.postpone_subscription(row["id"], row["hours"] * 3600 if successful else 900)
+            self.store.postpone_subscription(row["id"], row["hours"] * 3600 if complete else 900)
             if successful and scan.entries:
                 options = replace(self.prefs.options, force=False)
                 count = self.store.enqueue(scan.entries, options, only_new=True)
@@ -251,7 +260,7 @@ class Controller(QObject):
             self.changed.emit()
         else:
             needs_login = code in ("auth", "cookies", "playlist_access")
-            self.scanned.emit({**event, "entries": scan.entries, "warnings": scan.warnings,
+            self.scanned.emit({**event, "entries": entries, "warnings": scan.warnings, "complete": complete,
                                "login_retry": (scan.source, scan.tabs) if needs_login else None})
         if code in ("auth", "cookies") or (code == "playlist_access" and not scan.subscription):
             self.login_needed.emit(scan.source.url, event["message"], code == "auth")

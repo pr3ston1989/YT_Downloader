@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime
 import json
@@ -113,16 +114,36 @@ class PreviewModel(TableModel):
         super().__init__(("Pobierz", "Nr", "Tytuł", "Kanał", "Czas", "Zakładka"))
         self.selected = set()
         self.entries = []
+        self.checkable = True
 
     def set_entries(self, entries):
-        self.entries = entries
-        self.selected = set(range(len(entries)))
-        self.replace([("", str(e.index), e.title, e.channel, duration(e.duration), TAB_NAMES.get(e.tab, ""))
-                      for e in entries])
+        self.beginResetModel()
+        self.entries = []
+        self.selected.clear()
+        self.rows = []
+        self.endResetModel()
+        self.append_entries(entries)
+
+    def append_entries(self, entries):
+        if not entries:
+            return
+        first = len(self.entries)
+        end = first + len(entries)
+        self.beginInsertRows(QModelIndex(), first, end - 1)
+        self.entries.extend(entries)
+        self.selected.update(range(first, end))
+        self.rows.extend(("", str(e.index), e.title, e.channel, duration(e.duration), TAB_NAMES.get(e.tab, ""))
+                         for e in entries)
+        self.endInsertRows()
+
+    def set_checkable(self, checkable):
+        self.checkable = checkable
+        if self.rows:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, 0), [CHECK])
 
     def flags(self, index):
         flags = super().flags(index)
-        return flags | Qt.ItemFlag.ItemIsUserCheckable if index.column() == 0 else flags
+        return flags | Qt.ItemFlag.ItemIsUserCheckable if self.checkable and index.column() == 0 else flags
 
     def data(self, index, role=DISPLAY):
         if index.isValid() and index.column() == 0 and role == CHECK:
@@ -130,7 +151,7 @@ class PreviewModel(TableModel):
         return super().data(index, role)
 
     def setData(self, index, value, role=CHECK):
-        if not index.isValid() or index.column() != 0 or role != CHECK:
+        if not self.checkable or not index.isValid() or index.column() != 0 or role != CHECK:
             return False
         if value in (Qt.CheckState.Checked, Qt.CheckState.Checked.value):
             self.selected.add(index.row())
@@ -303,7 +324,7 @@ class Window(QMainWindow):
         self.c.progress.connect(self.on_progress)
         self.c.message.connect(self.notify)
         self.c.scanned.connect(self.on_scan)
-        self.c.scan_progress.connect(lambda count: self.preview_info.setText(f"Odczytano pozycji: {count}…"))
+        self.c.scan_entries.connect(self.on_scan_entries)
         self.c.login_needed.connect(self.login_needed)
         self.c.update_ready.connect(self.apply_app_update)
         self.refresh()
@@ -338,12 +359,12 @@ class Window(QMainWindow):
         self.preview_table.setColumnWidth(4, 64)
         self.preview_info = QLabel("Podgląd")
         self.preview_info.setWordWrap(True)
+        self.select_all_button = button("Zaznacz wszystkie", lambda: self.preview_model.select_all(True))
+        self.select_none_button = button("Odznacz wszystkie", lambda: self.preview_model.select_all(False))
         self.add_button = button("Dodaj zaznaczone do kolejki", self.enqueue, primary=True)
-        self.add_button.setEnabled(False)
-        preview_layout.addWidget(row(self.preview_info, None,
-                                     button("Zaznacz wszystkie", lambda: self.preview_model.select_all(True)),
-                                     button("Odznacz wszystkie", lambda: self.preview_model.select_all(False)),
-                                     self.add_button))
+        self.set_preview_selectable(False)
+        preview_layout.addWidget(row(self.preview_info, None, self.select_all_button,
+                                     self.select_none_button, self.add_button))
         preview_layout.addWidget(self.preview_table)
         splitter.addWidget(preview_box)
         queue_box = QWidget()
@@ -521,23 +542,40 @@ class Window(QMainWindow):
         self.preview_button.setEnabled(False)
         self.cancel_button.show()
         self.preview_info.setText("Odczytywanie listy…")
+        self.preview_info.setToolTip("")
         self.preview_model.set_entries([])
-        self.add_button.setEnabled(False)
+        self.set_preview_selectable(False)
+
+    def set_preview_selectable(self, enabled):
+        self.preview_model.set_checkable(enabled)
+        self.select_all_button.setEnabled(enabled)
+        self.select_none_button.setEnabled(enabled)
+        self.add_button.setEnabled(enabled)
+
+    def on_scan_entries(self, offset, entries):
+        if offset == 0 and self.preview_model.entries:
+            self.preview_model.set_entries([])
+        self.preview_model.append_entries(entries)
+        self.preview_info.setText(f"Odczytano pozycji: {offset + len(entries)}…")
 
     def on_scan(self, result):
         self.preview_button.setEnabled(True)
         self.cancel_button.hide()
-        if result.get("cancelled"):
-            self.preview_info.setText("Odczyt anulowany.")
-        elif result["kind"] == "done":
-            self.preview_model.set_entries(result["entries"])
-            self.add_button.setEnabled(bool(result["entries"]))
-            warnings = ", ".join(TAB_NAMES.get(item["tab"], item["tab"]) for item in result["warnings"])
-            self.preview_info.setText(f"Pozycje: {len(result['entries'])}" +
-                                      (f" · pominięte zakładki: {warnings}" if warnings else ""))
+        entries = result["entries"]
+        if self.preview_model.entries != entries:
+            self.preview_model.set_entries(entries)
+        self.set_preview_selectable(bool(entries))
+        warnings = "\n".join(f"{TAB_NAMES.get(item['tab'], item['tab'])} — {item['message']}"
+                             for item in result["warnings"])
+        self.preview_info.setToolTip(warnings)
+        if result["complete"]:
+            self.preview_info.setText(f"Pozycje: {len(entries)}")
+        elif entries:
+            reason = result.get("message", "Nie udało się odczytać wszystkich zakładek.")
+            self.preview_info.setText(f"Niepełna lista · {len(entries)} pozycji. {reason}")
         else:
-            self.preview_info.setText(result["message"])
-            self.retry_preview = result["login_retry"]
+            self.preview_info.setText(result.get("message", "Nie udało się odczytać listy."))
+        self.retry_preview = result["login_retry"]
 
     def enqueue(self):
         try:
@@ -729,17 +767,20 @@ class Window(QMainWindow):
 
     def on_progress(self, job_id, event):
         self.queue_model.update_progress(job_id, event)
-        self.update_summary()
+        self.update_total_progress()
 
     def update_summary(self):
         jobs = self.queue_model.jobs
-        done = sum(job.state == "done" for job in jobs)
-        skipped = sum(job.state == "skipped" for job in jobs)
-        failed = sum(job.state == "failed" for job in jobs)
-        auth = sum(job.state == "auth" for job in jobs)
-        self.summary.setText(f"Gotowe: {done}   ·   Pominięte: {skipped}   ·   Nieudane: {failed}"
-                             f"   ·   Logowanie: {auth}   ·   Razem: {len(jobs)}")
-        progress = 100 * sum(job.state in TERMINAL for job in jobs)
+        counts = Counter(job.state for job in jobs)
+        self.summary.setText(f"Gotowe: {counts['done']}   ·   Pominięte: {counts['skipped']}"
+                             f"   ·   Nieudane: {counts['failed']}   ·   Logowanie: {counts['auth']}"
+                             f"   ·   Razem: {len(jobs)}")
+        self.finished_progress = 100 * sum(counts[state] for state in TERMINAL)
+        self.update_total_progress()
+
+    def update_total_progress(self):
+        jobs = self.queue_model.jobs
+        progress = self.finished_progress
         progress += sum(values.get("percent", 0) for values in self.queue_model.events.values())
         self.total.setValue(int(progress / len(jobs)) if jobs else 0)
 

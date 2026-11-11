@@ -13,6 +13,8 @@ Prywatna playlista wymaga konta, które może ją otworzyć w przeglądarce. Fil
 
 Jeśli przeglądarka blokuje odczyt ciasteczek, wybierz zalogowany profil Firefoksa lub zaimportuj plik Netscape. Z importowanego pliku aplikacja zachowuje tylko ciasteczka YouTube. Szyfruje je przez Windows DPAPI dla bieżącego użytkownika i przekazuje do yt-dlp w pamięci.
 
+Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę odczytu kolejnych stron. Po zakończeniu możesz wybrać pozycje do pobrania. Aplikacja ponawia odczyt bieżącej strony przy błędach połączenia obsługiwanych przez yt-dlp. Jeśli odczyt się nie powiedzie lub go anulujesz, podgląd zachowa odczytane pozycje i oznaczy listę jako niepełną.
+
 Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
 Domyślny szablon to `{channel}/{playlist}/{index} - {title} [{id}].{ext}`. Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.
@@ -64,6 +66,8 @@ Zainstaluj [Inno Setup](https://jrsoftware.org/isdl.php) w wersji 6.3 lub nowsze
 `dist\YTDownloader\YTDownloader.exe` wymaga całego folderu onedir. `dist\YTDownloader-Setup.exe` jest instalatorem, a `dist\YTDownloader-Setup.exe.sha256` zawiera jego sumę kontrolną. Parametr `-OnedirOnly` pomija kompilację instalatora. Możesz przekazać własną ścieżkę kompilatora przez `-ISCC`.
 
 Testy aktualizatora obejmują poprawną wymianę, zachowanie kopii poprzedniej, odrzucenie błędnej sumy, nieudany test uruchomieniowy i rollback po uszkodzeniu aktywnej wersji. GitHub Actions buduje instalator i uruchamia test dymny zapakowanej aplikacji.
+
+Testy podglądu sprawdzają kolejność wierszy z wielu stron, zachowanie częściowej listy po błędzie lub anulowaniu oraz dodawanie tysięcy pozycji do kolejki.
 
 ## Publikowanie nowej wersji
 

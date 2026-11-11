@@ -69,18 +69,17 @@ class Store:
 
     def enqueue(self, entries, options: Options, *, only_new=False):
         encoded = json.dumps(asdict(options), ensure_ascii=False)
-        count = 0
+        rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), encoded) for entry in entries)
         with self.db:
-            for entry in entries:
-                if only_new and self.db.execute("""
-                    SELECT id FROM downloads WHERE id=?
-                    UNION ALL SELECT video_id FROM jobs WHERE video_id=? AND state NOT IN ('skipped','failed')
-                """, (entry.id, entry.id)).fetchone():
-                    continue
-                self.db.execute("INSERT INTO jobs (video_id,entry,options) VALUES (?,?,?)",
-                                (entry.id, json.dumps(asdict(entry), ensure_ascii=False), encoded))
-                count += 1
-        return count
+            if only_new:
+                return self.db.executemany("""
+                    INSERT INTO jobs (video_id,entry,options)
+                    SELECT ?1, ?2, ?3
+                    WHERE NOT EXISTS (SELECT 1 FROM downloads WHERE id=?1)
+                    AND NOT EXISTS (SELECT 1 FROM jobs WHERE video_id=?1 AND state NOT IN ('skipped','failed'))
+                """, rows).rowcount
+            return self.db.executemany(
+                "INSERT INTO jobs (video_id,entry,options) VALUES (?,?,?)", rows).rowcount
 
     @staticmethod
     def job(row):

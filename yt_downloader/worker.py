@@ -69,7 +69,8 @@ def explain(error, *, source_kind=None):
         ("network", "Błąd sieci. Sprawdź połączenie z internetem.",
          ("timed out", "timeout", "connection", "network is unreachable", "getaddrinfo",
           "http error 429", "http error 500", "http error 502", "http error 503", "http error 504",
-          "name resolution", "urlopen error", "remote end closed", "incomplete read")),
+          "name resolution", "urlopen error", "remote end closed", "incomplete read",
+          "incomplete data received")),
         ("extractor", "Silnik nie odczytał strumieni YouTube.",
          ("unable to extract", "http error 403", "signature extraction", "nsig", "challenge solving",
           "no video formats", "only images are available", "not available on this app")),
@@ -132,21 +133,37 @@ def scan(ydl, request, parameters, emit):
     source = request["source"]
     single = source["kind"] == "video"
     tabs = request["tabs"] if source["kind"] == "channel" else [""]
-    settings = {**parameters, "extract_flat": False if single else "in_playlist", "ignoreerrors": False,
-                "noplaylist": single, "skip_download": True}
+    settings = {
+        **parameters,
+        "extract_flat": False if single else "in_playlist",
+        "ignoreerrors": False,
+        "noplaylist": single,
+        "skip_download": True,
+    }
+    if not single:
+        settings.update(
+            extractor_retries=3,
+            retry_sleep_functions={"extractor": lambda attempt: min(2 ** (attempt - 1), 8)},
+            extractor_args={"youtube": {"raise_incomplete_data": ["1"]}},
+        )
     count = 0
     last_error = None
     for tab in tabs:
         url = f"{source['url']}/{tab}" if tab else source["url"]
         try:
             with ydl(settings) as client:
-                info = client.extract_info(url, download=False)
-                entries = info.get("entries", ()) if "entries" in info else (info,)
-                for index, entry in enumerate(entries, 1):
-                    if not entry or not VIDEO_ID.fullmatch(entry.get("id", "")):
+                # Processing a playlist in YoutubeDL returns entries only after exhausting
+                # the continuation iterator. Read that iterator directly for the preview.
+                info = client.extract_info(url, download=False, process=single)
+                if info.get("_type") in ("url", "url_transparent"):
+                    info = client.process_ie_result(info, download=False)
+                entries = info.get("entries", (info,))
+                for index, entry in enumerate(() if entries is None else entries, 1):
+                    video_id = entry.get("id") if entry else None
+                    if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
                         continue
                     item = Entry(
-                        entry["id"], entry.get("title") or entry["id"],
+                        video_id, entry.get("title") or video_id,
                         entry.get("channel") or entry.get("uploader")
                         or info.get("channel") or info.get("uploader") or "",
                         info.get("title") or "" if not single else "",
