@@ -256,6 +256,46 @@ def add_album_metadata(client, entry):
     client.add_post_processor(AlbumMetadata(client), when="pre_process")
 
 
+def bind_partial_download(client, stem, marker, emit):
+    selector = client.format_selector
+
+    def select(context):
+        for selected in selector(context):
+            formats = selected.get("requested_formats") or (selected,)
+            identity = [{key: fmt.get(key) for key in
+                         ("format_id", "ext", "vcodec", "acodec", "language", "protocol", "filesize")}
+                        for fmt in formats]
+            try:
+                previous = json.loads(marker.read_text(encoding="utf-8"))
+                if not isinstance(previous, list):
+                    previous = []
+            except FileNotFoundError:
+                previous = None
+            except ValueError:
+                previous = []
+            if previous is not None and previous != identity:
+                # The same filename can receive a different encoding after a retry.
+                # Only remove incomplete files and yt-dlp's separate stream intermediates.
+                prefix = stem.name + "."
+                intermediates = {
+                    f"f{fmt.get('format_id')}.{fmt.get('ext')}" for fmt in previous if isinstance(fmt, dict)
+                }
+                discarded = False
+                for path in stem.parent.iterdir():
+                    suffix = path.name.removeprefix(prefix)
+                    if suffix != path.name and (suffix in intermediates or re.fullmatch(
+                            r"(?:f[\w+-]+\.)?[\w]+\.(?:part(?:-Frag\d+)?|ytdl)", suffix)):
+                        path.unlink()
+                        discarded = True
+                if discarded:
+                    emit("log", detail="Strumień zmienił się. Rozpoczęto pobieranie od początku.")
+            if previous != identity:
+                atomic_json(marker, identity)
+            yield selected
+
+    client.format_selector = select
+
+
 def download(ydl, request, parameters, emit):
     from yt_dlp.postprocessor import get_postprocessor
 
@@ -266,6 +306,7 @@ def download(ydl, request, parameters, emit):
     stem.parent.mkdir(parents=True, exist_ok=True)
     extension = options.audio_format if options.audio_only else options.container
     final = Path(f"{stem}.{extension}")
+    marker = stem.with_name(stem.name + ".yt-resume.json")
     last_update = 0.0
     streams_done = 0
 
@@ -324,6 +365,7 @@ def download(ydl, request, parameters, emit):
     if entry.music:
         settings.update(check_formats="selected", paths={"temp": tempfile.gettempdir()})
     with ydl(settings) as client:
+        bind_partial_download(client, stem, marker, emit)
         if options.metadata and entry.music and (entry.album or entry.track_number):
             add_album_metadata(client, entry)
         if options.audio_only:
@@ -336,6 +378,7 @@ def download(ydl, request, parameters, emit):
         client.extract_info(entry.url, download=True)
     if not final.is_file() or not final.stat().st_size:
         raise OSError("Nie powstał końcowy plik multimedialny.")
+    marker.unlink(missing_ok=True)
     emit("done", path=str(final))
 
 

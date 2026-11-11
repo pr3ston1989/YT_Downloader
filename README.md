@@ -23,11 +23,13 @@ Wklej link do utworu, playlisty albo albumu YouTube Music. Album możesz wkleić
 
 Dla YouTube Music podgląd domyślnie wybiera **Tylko audio**. Zmień tryb przy podglądzie, jeśli chcesz dodać wideo. Format MP3, M4A lub Opus i bitrate ustawisz w **Ustawieniach**. Przy włączonych metadanych aplikacja zapisuje album i numer utworu, gdy są dostępne. Historia rozpoznaje ten sam identyfikator niezależnie od tego, z którego serwisu pochodzi link.
 
-Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
+Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Gdy silnik wybierze inny strumień, aplikacja rozpoczyna pobieranie od początku. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
 Domyślny szablon to `{channel}/{playlist}/{index} - {title} [{id}].{ext}`. Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.
 
 Subskrypcje sprawdzają wybrane zakładki kanału, gdy aplikacja działa, także w zasobniku. Pierwsze sprawdzenie uwzględnia materiały dostępne w tych zakładkach i pomija ID z historii. Autostart Windows i praca w zasobniku są domyślnie wyłączone.
+
+Subskrypcja wykonawcy z YouTube Music dodaje zadania w trybie audio. Gdy kanał wymaga logowania, jego subskrypcja czeka na **Zalogowano · ponów**, a pozostałe są sprawdzane zgodnie z harmonogramem. Usunięcie subskrypcji przerywa jej bieżący odczyt.
 
 ## Aktualizacje
 
@@ -76,6 +78,8 @@ Zainstaluj [Inno Setup](https://jrsoftware.org/isdl.php) w wersji 6.3 lub nowsze
 Testy aktualizatora obejmują poprawną wymianę, zachowanie kopii poprzedniej, odrzucenie błędnej sumy, nieudany test uruchomieniowy i rollback po uszkodzeniu aktywnej wersji. GitHub Actions buduje instalator i uruchamia test dymny zapakowanej aplikacji.
 
 Testy podglądu sprawdzają kolejność wierszy z wielu stron, zachowanie częściowej listy po błędzie lub anulowaniu oraz dodawanie tysięcy pozycji do kolejki.
+
+Testy transferu zatrzymują osobny proces podczas pobierania z lokalnego serwera i porównują gotowy plik bajt po bajcie. Sprawdzają wznowienie oraz zmianę formatu w trakcie ponowienia. Test aktualizacji Windows sprawdza także zachowanie wstrzymanej kolejki po instalacji nowej wersji.
 
 ## Publikowanie nowej wersji
 

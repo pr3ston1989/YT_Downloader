@@ -1,5 +1,7 @@
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -57,3 +59,19 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(parse_source("youtube.com/@channel/shorts").tab, "shorts")
         with self.assertRaises(ValueError):
             parse_source("youtube.com.example/watch?v=jNQXAC9IVRw")
+
+    def test_subscription_migration_preserves_the_previous_schedule(self):
+        old = self.root / "old-profile"
+        old.mkdir()
+        with closing(sqlite3.connect(old / "data.sqlite3")) as db:
+            db.executescript("""
+                CREATE TABLE subscriptions (
+                    id INTEGER PRIMARY KEY, url TEXT NOT NULL, tabs TEXT NOT NULL,
+                    hours INTEGER NOT NULL, due REAL NOT NULL, UNIQUE(url, tabs)
+                );
+                INSERT INTO subscriptions VALUES (17, 'https://www.youtube.com/@test', '["videos"]', 6, 1234);
+            """)
+        with closing(Store(old)) as migrated:
+            row = migrated.subscriptions()[0]
+            self.assertEqual((row["id"], row["hours"], row["due"]), (17, 6, 1234))
+            self.assertEqual((row["needs_login"], row["music"]), (0, 0))

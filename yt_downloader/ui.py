@@ -761,9 +761,12 @@ class Window(QMainWindow):
 
     def refresh_login_actions(self):
         waiting = next((job for job in self.queue_model.jobs if job.state == "auth"), None)
+        subscription = self.c.store.subscription_needing_login()
         if waiting:
             self.login_url = waiting.entry.url
-        visible = bool(waiting or self.retry_preview)
+        elif subscription:
+            self.login_url = subscription["url"]
+        visible = bool(waiting or subscription or self.retry_preview)
         self.login.setVisible(visible)
         self.retry_login.setVisible(visible)
 
@@ -776,7 +779,7 @@ class Window(QMainWindow):
             if not tabs:
                 raise ValueError("Wybierz zakładki subskrypcji.")
             self.c.prefs.options.validate()
-            self.c.store.add_subscription(source.url, tabs, self.hours.value())
+            self.c.store.add_subscription(source.url, tabs, self.hours.value(), music=source.music)
         except ValueError as exc:
             self.notify(str(exc))
             return
@@ -785,9 +788,8 @@ class Window(QMainWindow):
 
     def delete_subscriptions(self):
         rows = self.c.store.subscriptions()
-        for index in self.sub_view.selectionModel().selectedRows():
-            self.c.store.remove_subscription(rows[index.row()]["id"])
-        self.refresh()
+        ids = [rows[index.row()]["id"] for index in self.sub_view.selectionModel().selectedRows()]
+        self.c.remove_subscriptions(ids)
 
     def refresh(self):
         runtime = self.c.manager.snapshot()
@@ -807,8 +809,10 @@ class Window(QMainWindow):
             self.updates.replace([(stamp(r["time"]), r["component"], r["version"], r["status"], r["detail"])
                                   for r in self.c.store.update_history()])
         elif page == 4:
-            self.subscriptions.replace([(r["url"], ", ".join(TAB_NAMES[t] for t in json.loads(r["tabs"])),
-                                         str(r["hours"]), stamp(r["due"]) if r["due"] else "Wkrótce")
+            self.subscriptions.replace([(r["url"] + (" · YouTube Music" if r["music"] else ""),
+                                         ", ".join(TAB_NAMES[t] for t in json.loads(r["tabs"])), str(r["hours"]),
+                                         "Wymaga logowania" if r["needs_login"]
+                                         else stamp(r["due"]) if r["due"] else "Wkrótce")
                                         for r in self.c.store.subscriptions()])
 
     def on_progress(self, job_id, event):

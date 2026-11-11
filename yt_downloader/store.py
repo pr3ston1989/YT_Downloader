@@ -47,11 +47,17 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id INTEGER PRIMARY KEY, url TEXT NOT NULL, tabs TEXT NOT NULL,
-                hours INTEGER NOT NULL, due REAL NOT NULL, UNIQUE(url, tabs)
+                hours INTEGER NOT NULL, due REAL NOT NULL,
+                needs_login INTEGER NOT NULL DEFAULT 0, music INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(url, tabs)
             );
         """)
         if "auth_attempts" not in {column["name"] for column in self.db.execute("PRAGMA table_info(jobs)")}:
             self.db.execute("ALTER TABLE jobs ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0")
+        columns = {column["name"] for column in self.db.execute("PRAGMA table_info(subscriptions)")}
+        for name in ("needs_login", "music"):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE subscriptions ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
 
     def close(self):
         self.db.close()
@@ -141,6 +147,7 @@ class Store:
                 UPDATE jobs SET state='queued', reason='', ready=0, auth_attempts=auth_attempts+1
                 WHERE state='auth'
             """)
+            self.db.execute("UPDATE subscriptions SET needs_login=0, due=0 WHERE needs_login=1")
 
     def clear_jobs(self):
         with self.db:
@@ -161,21 +168,27 @@ class Store:
     def update_history(self):
         return self.db.execute("SELECT * FROM updates ORDER BY rowid DESC LIMIT 500").fetchall()
 
-    def add_subscription(self, url, tabs, hours):
+    def add_subscription(self, url, tabs, hours, *, music=False):
         with self.db:
-            self.db.execute("INSERT OR REPLACE INTO subscriptions (url,tabs,hours,due) VALUES (?,?,?,0)",
-                            (url, json.dumps(tabs), hours))
+            self.db.execute("""
+                INSERT INTO subscriptions (url,tabs,hours,due,music) VALUES (?,?,?,0,?)
+                ON CONFLICT(url,tabs) DO UPDATE SET hours=excluded.hours, music=excluded.music
+            """, (url, json.dumps(tabs), hours, music))
 
     def subscriptions(self):
         return self.db.execute("SELECT * FROM subscriptions ORDER BY id").fetchall()
 
     def subscription_due(self):
-        return self.db.execute("SELECT * FROM subscriptions WHERE due<=? ORDER BY due LIMIT 1",
+        return self.db.execute("SELECT * FROM subscriptions WHERE needs_login=0 AND due<=? ORDER BY due,id LIMIT 1",
                                (time.time(),)).fetchone()
 
-    def postpone_subscription(self, sub_id, seconds):
+    def subscription_needing_login(self):
+        return self.db.execute("SELECT * FROM subscriptions WHERE needs_login=1 ORDER BY id LIMIT 1").fetchone()
+
+    def postpone_subscription(self, sub_id, seconds, *, needs_login=False):
         with self.db:
-            self.db.execute("UPDATE subscriptions SET due=? WHERE id=?", (time.time() + seconds, sub_id))
+            return self.db.execute("UPDATE subscriptions SET due=?, needs_login=? WHERE id=?",
+                                   (time.time() + seconds, needs_login, sub_id)).rowcount != 0
 
     def remove_subscription(self, sub_id):
         with self.db:

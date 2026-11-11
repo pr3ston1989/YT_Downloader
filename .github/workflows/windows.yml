@@ -29,22 +29,35 @@ jobs:
           python -m unittest discover -s tests -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\packaging\build.ps1 -Python python
-      - name: Test pagination and audio with the verified media tools
+      - name: Test pagination, audio and transfer recovery with the verified media tools
         run: |
           python -m unittest discover -s tests -p test_pagination.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s tests -p test_music.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_transfer.py -v
       - name: Install and smoke test
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
           $installDir = Join-Path $env:RUNNER_TEMP "YT Downloader"
-          $setupArgs = "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOICONS",
+          $setupArgs = "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                        ('/DIR="' + $installDir + '"')
           $setup = Start-Process -FilePath ".\dist\YTDownloader-Setup.exe" -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
           if ($setup.ExitCode -ne 0) { exit $setup.ExitCode }
+          $shell = New-Object -ComObject WScript.Shell
+          $exe = Join-Path $installDir "YTDownloader.exe"
+          $shortcuts = @(
+            (Join-Path ([Environment]::GetFolderPath("Programs")) "YT Downloader\YT Downloader.lnk")
+            (Join-Path ([Environment]::GetFolderPath("DesktopDirectory")) "YT Downloader.lnk")
+          )
+          foreach ($link in $shortcuts) {
+            if (-not (Test-Path -LiteralPath $link) -or $shell.CreateShortcut($link).TargetPath -ne $exe) {
+              throw "Missing or invalid installed shortcut: $link"
+            }
+          }
           $data = Join-Path $env:RUNNER_TEMP "YT Downloader test"
           $smokeArgs = "--smoke-test", ('"' + $data + '"')
-          $app = Start-Process -FilePath (Join-Path $installDir "YTDownloader.exe") -ArgumentList $smokeArgs -Wait -PassThru -WindowStyle Hidden
+          $app = Start-Process -FilePath $exe -ArgumentList $smokeArgs -Wait -PassThru -WindowStyle Hidden
           if ($app.ExitCode -ne 0) {
             if (Test-Path "$data\app.log") { Get-Content "$data\app.log" }
             exit $app.ExitCode

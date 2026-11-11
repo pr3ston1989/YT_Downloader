@@ -12,6 +12,11 @@ import sys
 import time
 from urllib.request import urlopen
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from yt_downloader.model import Entry, Options
+from yt_downloader.store import Store
+
 
 def sha256(path):
     with path.open("rb") as stream:
@@ -54,6 +59,11 @@ def verify(previous, expected):
     executable = target / "YTDownloader.exe"
     original = sha256(executable)
     root = data / "YTDownloader"
+    saved = Entry("jNQXAC9IVRw", "Paused upgrade fixture")
+    with closing(Store(root)) as store:
+        store.set("queue_paused", True)
+        store.enqueue([saved], Options(folder=str(scratch / "downloads")))
+        store.state(store.jobs()[0].id, "paused")
     # Model a launch from Explorer rather than inheriting the runner's PowerShell 7 module paths.
     env = {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
     env.update(LOCALAPPDATA=str(data), QT_QPA_PLATFORM="offscreen")
@@ -66,7 +76,12 @@ def verify(previous, expected):
             if any(version == expected and status == "zainstalowano" for version, status, _ in history):
                 if app.poll() != 0 or sha256(executable) == original:
                     raise RuntimeError("The prior process or executable was not replaced.")
-                print(f"Verified automatic upgrade and restart from {previous} to {expected}.")
+                with closing(Store(root)) as store:
+                    jobs = store.jobs()
+                    if not (store.get("queue_paused") and len(jobs) == 1
+                            and jobs[0].entry == saved and jobs[0].state == "paused"):
+                        raise RuntimeError("The update did not preserve the paused queue.")
+                print(f"Verified automatic upgrade, restart and queue preservation from {previous} to {expected}.")
                 return
             if any(status == "błąd instalacji" for _, status, _ in history):
                 break

@@ -19,6 +19,7 @@ from .updates.manager import COMPONENTS
 
 LOG = logging.getLogger(__name__)
 CHECK_INTERVAL = 6 * 3600
+LOGIN_ERRORS = ("auth", "cookies")
 LABELS = {"queued": "W kolejce", "running": "Pobieranie", "paused": "Wstrzymano",
           "repair": "Aktualizacja silnika", "auth": "Wymaga logowania",
           "done": "Gotowe", "skipped": "Pominięto", "failed": "Nieudane"}
@@ -33,7 +34,7 @@ class Running:
     stopped: bool = False
 
 
-@dataclass
+@dataclass(eq=False)
 class Scan:
     source: Source
     tabs: tuple
@@ -147,11 +148,11 @@ class Controller(QObject):
             for job in self.store.jobs():
                 if job.state == "repair":
                     self.store.state(job.id, "queued")
-            if self.scan and not self.scan.worker:
+            if self.scan and not self.scan.worker and self.scan not in self.pending_repairs:
                 self.start_scan_worker()
             return
         if mode == "repair":
-            if None in repairs and self.scan and not self.scan.worker:
+            if self.scan in repairs and not self.scan.worker:
                 self.start_scan_worker()
             for job in self.store.jobs():
                 if job.id in repairs and job.state == "repair":
@@ -204,7 +205,7 @@ class Controller(QObject):
         scan = self.scan
         if not scan:
             return
-        self.pending_repairs.pop(None, None)
+        self.pending_repairs.pop(scan, None)
         if scan.worker:
             scan.worker.close()
         self.finish_scan({"kind": "cancelled", "message": "Odczyt anulowany."})
@@ -233,7 +234,7 @@ class Controller(QObject):
             scan.worker = None
             event = scan.outcome or {"kind": "error", "message": "Proces podglądu został przerwany."}
             if event.get("code") == "extractor" and self.prefs.auto_update and scan.recovery < 2:
-                self.pending_repairs[None] = self.recovery_channel(scan.recovery)
+                self.pending_repairs[scan] = self.recovery_channel(scan.recovery)
                 scan.recovery += 1
                 self.message.emit("Sprawdzam silnik przed ponownym odczytem listy.")
                 return
@@ -249,45 +250,56 @@ class Controller(QObject):
         if not complete and len(scan.previous_entries) > len(entries):
             entries = scan.previous_entries
         code = event.get("code")
+        login = event if code in LOGIN_ERRORS else next(
+            (warning for warning in scan.warnings if warning.get("code") in LOGIN_ERRORS), None)
         if scan.subscription:
             row = scan.subscription
-            self.store.postpone_subscription(row["id"], row["hours"] * 3600 if complete else 900)
+            active = self.store.postpone_subscription(row["id"], row["hours"] * 3600 if complete else 900,
+                                                      needs_login=bool(login))
+            if not active:
+                self.changed.emit()
+                return
             if successful and scan.entries:
-                options = replace(self.prefs.options, force=False)
+                options = replace(self.prefs.options, force=False,
+                                  audio_only=scan.source.music or self.prefs.options.audio_only)
                 count = self.store.enqueue(scan.entries, options, only_new=True)
                 if count:
                     self.message.emit(f"Subskrypcja dodała {count} nowych pozycji.")
             self.changed.emit()
         else:
-            needs_login = code in ("auth", "cookies", "playlist_access")
+            if code == "playlist_access":
+                login = event
             self.scanned.emit({**event, "entries": entries, "warnings": scan.warnings, "complete": complete,
-                               "login_retry": (scan.source, scan.tabs) if needs_login else None})
-        if code in ("auth", "cookies") or (code == "playlist_access" and not scan.subscription):
-            self.login_needed.emit(scan.source.url, event["message"], code == "auth")
+                               "login_retry": (scan.source, scan.tabs) if login else None})
+        if login:
+            self.login_needed.emit(scan.source.url, login["message"], login["code"] == "auth")
 
     def recovery_channel(self, recovery):
         return "nightly" if recovery or self.prefs.channel == "nightly" else "stable"
 
-    def poll_jobs(self):
+    def poll_jobs(self, *, closing=False):
         changed = False
         for job_id, item in list(self.active.items()):
             finished = item.worker.poll() is not None
             for event in item.worker.events():
                 kind = event["kind"]
-                if kind in ("progress", "processing") and not item.stopped:
+                if kind in ("progress", "processing") and not (item.stopped or closing):
                     self.progress.emit(job_id, event)
                 elif kind == "log":
                     LOG.warning("Film %s / %s", item.job.entry.id, event["detail"])
                 elif kind in ("done", "error"):
                     item.outcome = event
-            if not finished:
+            completed = item.outcome.get("kind") == "done"
+            if not finished and not (closing and completed):
                 continue
             item.worker.close()
             del self.active[job_id]
-            if not item.stopped:
+            # A pause may arrive after the worker published its completed file but
+            # before the next timer tick read the completion event.
+            if completed or not (item.stopped or closing):
                 self.finish_job(item)
             changed = True
-        if changed:
+        if changed and not closing:
             self.changed.emit()
 
     def finish_job(self, item: Running):
@@ -345,6 +357,14 @@ class Controller(QObject):
         self.store.retry_auth()
         self.changed.emit()
 
+    def remove_subscriptions(self, ids):
+        for sub_id in ids:
+            self.store.remove_subscription(sub_id)
+        if self.scan and self.scan.subscription and self.scan.subscription["id"] in ids:
+            self.cancel_scan()
+        else:
+            self.changed.emit()
+
     def tick(self):
         try:
             self.step()
@@ -374,7 +394,8 @@ class Controller(QObject):
         if not self.manager.snapshot().ready:
             return
         if not self.scan and not self.install_pending and (row := self.store.subscription_due()):
-            self.preview(parse_source(row["url"]), json.loads(row["tabs"]), dict(row))
+            source = replace(parse_source(row["url"]), music=bool(row["music"]))
+            self.preview(source, json.loads(row["tabs"]), dict(row))
         if self.paused or self.install_pending or any(item.stopped for item in self.active.values()):
             return
         changed = self.store.skip_downloaded()
@@ -396,6 +417,7 @@ class Controller(QObject):
 
     def close(self):
         self.timer.stop()
+        self.poll_jobs(closing=True)
         if self.scan and self.scan.worker:
             self.scan.worker.close()
         for item in self.active.values():
