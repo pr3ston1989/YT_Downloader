@@ -711,7 +711,10 @@ class Window(QMainWindow):
 
     def set_preview_selectable(self, enabled):
         self.preview_model.set_checkable(enabled)
-        self.preview_order.setEnabled(enabled and len(self.preview_model.entries) > 1)
+        multiple = len(self.preview_model.entries) > 1
+        for order in ("reverse", "oldest", "newest"):
+            self.preview_order.model().item(self.preview_order.findData(order)).setEnabled(multiple)
+        self.preview_order.setEnabled(enabled and (multiple or bool(self.preview_model.episode_numbers)))
         self.refresh_preview_actions()
 
     def order_preview(self):
@@ -770,6 +773,9 @@ class Window(QMainWindow):
         entries = result["entries"]
         if self.preview_model.entries != entries:
             self.preview_model.set_entries(entries)
+        self.preview_model.episode_numbers = detect_episode_numbers(entries)
+        detected = bool(self.preview_model.episode_numbers)
+        self.episode_order.setEnabled(detected)
         self.set_preview_selectable(bool(entries))
         warnings = "\n".join(f"{TAB_NAMES.get(item['tab'], item['tab'])} — {item['message']}"
                              for item in result["warnings"])
@@ -783,9 +789,6 @@ class Window(QMainWindow):
         else:
             self.preview_info.setText(result.get("message", "Nie udało się odczytać listy."))
         self.retry_preview = result["login_retry"]
-        self.preview_model.episode_numbers = detect_episode_numbers(entries)
-        detected = bool(self.preview_model.episode_numbers)
-        self.episode_order.setEnabled(detected)
         if detected:
             self.preview_order.setCurrentIndex(self.preview_order.findData("episode"))
 

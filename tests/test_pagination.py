@@ -29,6 +29,18 @@ class PaginationWorkerTests(unittest.TestCase):
             "Podsumowanie | 2023", "Koncert 2024", "Zapowiedź #4", "Dokument (2025)", "Powrót 1999"), 1)]
         self.assertEqual(detect_episode_numbers(entries), {})
 
+    def test_single_title_requires_an_episode_marker_or_distinct_separator(self):
+        for title, expected in (
+            ("Tytuł | 450.", {0: (0, 450)}),
+            ("Odc. 23 – Tytuł", {0: (0, 23)}),
+            ("Tytuł S02E07", {0: (2, 7)}),
+            ("Tytuł 450", {}),
+            ("Tytuł (450)", {}),
+            ("Tytuł | 2025", {}),
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(detect_episode_numbers([Entry(entry(1).id, title)]), expected)
+
     def test_continuations_are_consumed_incrementally_and_keep_original_order(self):
         events = []
 
@@ -315,6 +327,26 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertEqual([job.entry.index_label for job in jobs],
                          ["045", "104", "284", "451", "S02E007", "Bez numeru 001", "Bez numeru 002"])
         self.assertTrue(output_stem(jobs[3].entry, jobs[3].options, jobs[3].id).name.startswith("451 - "))
+
+    def test_direct_episode_link_uses_the_episode_number_in_the_file_name(self):
+        video = Entry("ECKuiSbGWxY", "Wśród nocnej ciszy. Prawdziwa historia o zbrodni połanieckiej | 450.")
+        self.controller.cancel_scan()
+        self.window.source.setText(video.url)
+        self.window.preview()
+        self.worker.poll.return_value = 0
+        self.worker.events.return_value = [{"kind": "entry", "entry": asdict(video)}, {"kind": "done"}]
+        self.controller.poll_scan()
+
+        order = self.window.preview_order
+        self.assertTrue(order.isEnabled())
+        self.assertEqual(order.currentData(), "episode")
+        self.assertFalse(order.model().item(order.findData("reverse")).isEnabled())
+        self.assertEqual(self.window.preview_filter.index(0, 1).data(), "450")
+        self.window.add_button.click()
+        job, = self.controller.store.jobs()
+        self.assertEqual(job.entry.index_label, "450")
+        self.assertEqual(output_stem(job.entry, job.options, job.id).name,
+                         "450 - Wśród nocnej ciszy. Prawdziwa historia o zbrodni połanieckiej _ 450 [ECKuiSbGWxY]")
 
 
 if __name__ == "__main__":

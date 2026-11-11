@@ -19,7 +19,7 @@ MARKED_EPISODE = re.compile(
 STRUCTURED_EPISODE = re.compile(
     r"^([0-9]{1,4})(?:\.\s+|\s+[-–—|]\s+)|"
     r"(?:[|–—]\s*|\s-\s+)([0-9]{1,4})\s*\.?(?:\s+(?:(?:video|wideo)\s+)?podcast)?\s*$|"
-    r"[\[(]([0-9]{1,4})[\])]\s*$", re.IGNORECASE)
+    r"[\[(](?P<bracketed>[0-9]{1,4})[\])]\s*$", re.IGNORECASE)
 TRAILING_NUMBER = re.compile(r"\s([0-9]{1,4})\.?\s*$")
 
 
@@ -109,6 +109,7 @@ class Entry:
 
 
 def detect_episode_numbers(entries):
+    single = len(entries) == 1
     marked, structured, trailing = {}, {}, {}
     for row, entry in enumerate(entries):
         title = entry.title.strip()
@@ -118,7 +119,7 @@ def detect_episode_numbers(entries):
             marked[row] = (0, int(match[1]))
         elif match := STRUCTURED_EPISODE.search(title):
             number = int(next(group for group in match.groups() if group))
-            if not 1900 <= number <= 2099:
+            if not 1900 <= number <= 2099 and (not single or match["bracketed"] is None):
                 structured[row] = (0, number)
         elif match := TRAILING_NUMBER.search(title):
             number = int(match[1])
@@ -126,6 +127,8 @@ def detect_episode_numbers(entries):
                 trailing[row] = (0, number)
 
     numbers = marked | structured
+    if single:
+        return numbers
     distinct = len(set(numbers.values()))
     if len(set(marked.values())) >= 2 and distinct * 4 >= len(entries):
         return numbers

@@ -21,7 +21,7 @@ Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kole
 
 W podglądzie możesz zachować kolejność źródła, odwrócić listę albo posortować ją według dat publikacji. Daty z podglądu mogą być przybliżone. Pozycje bez dat trafiają na koniec. Jeśli playlista zaczyna się od najnowszych i nie zawiera dat, wybierz **Odwróć listę**. Po zmianie kolejności pole `{index}` używa numerów z całej posortowanej listy, także gdy dodajesz tylko zaznaczone pozycje.
 
-Przy spójnej numeracji w tytułach podgląd automatycznie wybiera **Według numeru odcinka**. Rozpoznaje m.in. `Odc. 23`, `#23`, `S02E07` i oznaczenia typu `| 23.`. Pole `{index}` zachowuje numer odcinka i jego ewentualny sezon. Pozycje bez rozpoznanego numeru trafiają na koniec. Kolejność można zmienić przed dodaniem pozycji do kolejki.
+Przy spójnej numeracji w tytułach podgląd automatycznie wybiera **Według numeru odcinka**. Rozpoznaje m.in. `Odc. 23`, `#23`, `S02E07` i oznaczenia typu `| 23.`. Jednoznaczne oznaczenia są rozpoznawane także dla pojedynczego filmu. Pole `{index}` zachowuje numer odcinka i jego ewentualny sezon. Pozycje bez rozpoznanego numeru trafiają na koniec. Kolejność można zmienić przed dodaniem pozycji do kolejki.
 
 W karcie **Historia pobrań** kliknij **Importuj archiwum yt-dlp…**, aby wczytać plik tekstowy z wierszami `youtube ID_FILMU`. Znane identyfikatory są pomijane przy dodawaniu materiałów do kolejki i przez subskrypcje. Aby pobrać materiał ponownie, zaznacz **Pobieraj ponownie filmy z historii** w parametrach podglądu.
 
