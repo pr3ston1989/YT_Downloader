@@ -15,6 +15,14 @@ Jeśli przeglądarka blokuje odczyt ciasteczek, wybierz zalogowany profil Firefo
 
 Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę odczytu kolejnych stron. Po zakończeniu możesz wybrać pozycje do pobrania. Aplikacja ponawia odczyt bieżącej strony przy błędach połączenia obsługiwanych przez yt-dlp. Jeśli odczyt się nie powiedzie lub go anulujesz, podgląd zachowa odczytane pozycje i oznaczy listę jako niepełną.
 
+Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kolejki do widocznych wierszy. Po wyczyszczeniu filtra zobaczysz ponownie całą listę.
+
+## YouTube Music
+
+Wklej link do utworu, playlisty albo albumu YouTube Music. Album możesz wkleić jako link do strony `browse/MPRE…` albo do listy `OLAK5uy_…`. Link do wykonawcy otwiera podgląd zakładek jego kanału YouTube. Jeśli kanał typu Topic nie ma zakładki Filmy, aplikacja spróbuje odczytać jego listę przesłanych materiałów. Link do utworu z automatycznym miksem w tle otwiera sam utwór.
+
+Dla YouTube Music podgląd domyślnie wybiera **Tylko audio**. Zmień tryb przy podglądzie, jeśli chcesz dodać wideo. Format MP3, M4A lub Opus i bitrate ustawisz w **Ustawieniach**. Przy włączonych metadanych aplikacja zapisuje album i numer utworu, gdy są dostępne. Historia rozpoznaje ten sam identyfikator niezależnie od tego, z którego serwisu pochodzi link.
+
 Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
 Domyślny szablon to `{channel}/{playlist}/{index} - {title} [{id}].{ext}`. Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.

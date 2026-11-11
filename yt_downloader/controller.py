@@ -244,7 +244,7 @@ class Controller(QObject):
         if event.get("detail"):
             LOG.warning("Odczyt listy / %s", event["detail"])
         successful = event["kind"] == "done"
-        complete = successful and not scan.warnings
+        complete = successful and all(warning.get("code") == "missing_tab" for warning in scan.warnings)
         entries = scan.entries
         if not complete and len(scan.previous_entries) > len(entries):
             entries = scan.previous_entries
@@ -311,7 +311,7 @@ class Controller(QObject):
             self.pending_repairs[job.id] = self.recovery_channel(job.recovery)
         elif code in ("auth", "cookies") and not job.auth_attempts:
             self.store.state(job.id, "auth", reason)
-            self.login_needed.emit(f"https://www.youtube.com/watch?v={job.entry.id}", reason, code == "auth")
+            self.login_needed.emit(job.entry.url, reason, code == "auth")
         else:
             if code == "auth":
                 reason += " Ponowienie po zalogowaniu nie dało dostępu."

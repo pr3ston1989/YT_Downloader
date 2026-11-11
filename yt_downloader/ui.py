@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import winreg
 
-from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, Qt, QTimer, QUrl
+from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, QSortFilterProxyModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
@@ -30,6 +30,8 @@ from .updates.application import restart_for
 
 LOG = logging.getLogger(__name__)
 TAB_NAMES = {"videos": "Filmy", "shorts": "Shorty", "streams": "Transmisje"}
+SOURCE_NAMES = {"video": "Film", "playlist": "Playlista", "channel": "Kanał", "album": "Album"}
+MUSIC_SOURCE_NAMES = {**SOURCE_NAMES, "video": "Utwór", "channel": "Kanał wykonawcy"}
 DISPLAY = Qt.ItemDataRole.DisplayRole
 CHECK = Qt.ItemDataRole.CheckStateRole
 USER = Qt.ItemDataRole.UserRole
@@ -160,8 +162,11 @@ class PreviewModel(TableModel):
         self.dataChanged.emit(index, index, [CHECK])
         return True
 
-    def select_all(self, selected):
-        self.selected = set(range(len(self.entries))) if selected else set()
+    def select_rows(self, rows, selected):
+        if selected:
+            self.selected.update(rows)
+        else:
+            self.selected.difference_update(rows)
         if self.rows:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, 0), [CHECK])
 
@@ -333,7 +338,7 @@ class Window(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         self.source = QLineEdit()
-        self.source.setPlaceholderText("Wklej link do filmu, playlisty lub kanału YouTube")
+        self.source.setPlaceholderText("Wklej link z YouTube lub YouTube Music")
         self.source_kind = QLabel()
         self.source_kind.setObjectName("muted")
         self.source.textChanged.connect(self.detect)
@@ -353,16 +358,28 @@ class Window(QMainWindow):
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(0, 0, 0, 4)
         self.preview_model = PreviewModel()
-        self.preview_table = table(self.preview_model, 2)
+        self.preview_filter = QSortFilterProxyModel(self)
+        self.preview_filter.setSourceModel(self.preview_model)
+        self.preview_filter.setFilterKeyColumn(2)
+        self.preview_filter.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.preview_table = table(self.preview_filter, 2)
         self.preview_table.setColumnWidth(0, 72)
         self.preview_table.setColumnWidth(1, 44)
         self.preview_table.setColumnWidth(4, 64)
         self.preview_info = QLabel("Podgląd")
         self.preview_info.setWordWrap(True)
-        self.select_all_button = button("Zaznacz wszystkie", lambda: self.preview_model.select_all(True))
-        self.select_none_button = button("Odznacz wszystkie", lambda: self.preview_model.select_all(False))
+        self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
+        self.select_none_button = button("Odznacz wszystkie", lambda: self.select_visible(False))
         self.add_button = button("Dodaj zaznaczone do kolejki", self.enqueue, primary=True)
+        self.preview_search = QLineEdit()
+        self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
+        self.preview_search.textChanged.connect(self.filter_preview)
+        self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
+        self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
         self.set_preview_selectable(False)
+        filter_row = row(self.preview_search, self.preview_mode)
+        filter_row.layout().setStretch(0, 1)
+        preview_layout.addWidget(filter_row)
         preview_layout.addWidget(row(self.preview_info, None, self.select_all_button,
                                      self.select_none_button, self.add_button))
         preview_layout.addWidget(self.preview_table)
@@ -508,7 +525,8 @@ class Window(QMainWindow):
     def detect(self):
         try:
             source = parse_source(self.source.text())
-            self.source_kind.setText({"video": "Film", "playlist": "Playlista", "channel": "Kanał"}[source.kind])
+            label = MUSIC_SOURCE_NAMES[source.kind] if source.music else SOURCE_NAMES[source.kind]
+            self.source_kind.setText(f"{label} · YouTube Music" if source.music else label)
             self.channel_row.setVisible(source.kind == "channel")
             if source.tab:
                 for tab, check in self.channel_tabs.items():
@@ -544,13 +562,36 @@ class Window(QMainWindow):
         self.preview_info.setText("Odczytywanie listy…")
         self.preview_info.setToolTip("")
         self.preview_model.set_entries([])
+        self.preview_search.clear()
+        self.preview_mode.setCurrentIndex(1 if source.music else 0)
         self.set_preview_selectable(False)
 
     def set_preview_selectable(self, enabled):
         self.preview_model.set_checkable(enabled)
+        self.refresh_preview_actions()
+
+    def filter_preview(self, text):
+        active = bool(text.strip())
+        self.preview_filter.setFilterFixedString(text.strip())
+        self.select_all_button.setText("Zaznacz widoczne" if active else "Zaznacz wszystkie")
+        self.select_none_button.setText("Odznacz widoczne" if active else "Odznacz wszystkie")
+        self.add_button.setText("Dodaj widoczne zaznaczone" if active else "Dodaj zaznaczone do kolejki")
+        self.refresh_preview_actions()
+
+    def refresh_preview_actions(self):
+        enabled = self.preview_model.checkable and self.preview_filter.rowCount() > 0
         self.select_all_button.setEnabled(enabled)
         self.select_none_button.setEnabled(enabled)
         self.add_button.setEnabled(enabled)
+
+    def visible_rows(self):
+        if not self.preview_search.text().strip():
+            return range(len(self.preview_model.entries))
+        return [self.preview_filter.mapToSource(self.preview_filter.index(row, 0)).row()
+                for row in range(self.preview_filter.rowCount())]
+
+    def select_visible(self, selected):
+        self.preview_model.select_rows(self.visible_rows(), selected)
 
     def on_scan_entries(self, offset, entries):
         if offset == 0 and self.preview_model.entries:
@@ -569,7 +610,8 @@ class Window(QMainWindow):
                              for item in result["warnings"])
         self.preview_info.setToolTip(warnings)
         if result["complete"]:
-            self.preview_info.setText(f"Pozycje: {len(entries)}")
+            missing = ", ".join(TAB_NAMES.get(item["tab"], item["tab"]) for item in result["warnings"])
+            self.preview_info.setText(f"Pozycje: {len(entries)}" + (f" · brak zakładek: {missing}" if missing else ""))
         elif entries:
             reason = result.get("message", "Nie udało się odczytać wszystkich zakładek.")
             self.preview_info.setText(f"Niepełna lista · {len(entries)} pozycji. {reason}")
@@ -578,15 +620,19 @@ class Window(QMainWindow):
         self.retry_preview = result["login_retry"]
 
     def enqueue(self):
+        options = self.c.prefs.options
+        mode = self.preview_mode.currentData()
+        if mode is not None:
+            options = replace(options, audio_only=mode)
         try:
-            self.c.prefs.options.validate()
+            options.validate()
         except ValueError as exc:
             self.notify(str(exc))
             return
-        entries = [self.preview_model.entries[i] for i in sorted(self.preview_model.selected)]
-        if entries:
-            count = self.c.store.enqueue(entries, self.c.prefs.options)
-            self.preview_model.select_all(False)
+        selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
+        if selected:
+            count = self.c.store.enqueue((self.preview_model.entries[i] for i in selected), options)
+            self.preview_model.select_rows(selected, False)
             self.notify(f"Dodano pozycji: {count}.")
             self.refresh()
 
@@ -716,7 +762,7 @@ class Window(QMainWindow):
     def refresh_login_actions(self):
         waiting = next((job for job in self.queue_model.jobs if job.state == "auth"), None)
         if waiting:
-            self.login_url = f"https://www.youtube.com/watch?v={waiting.entry.id}"
+            self.login_url = waiting.entry.url
         visible = bool(waiting or self.retry_preview)
         self.login.setVisible(visible)
         self.retry_login.setVisible(visible)

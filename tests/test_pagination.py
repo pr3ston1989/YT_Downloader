@@ -155,6 +155,27 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertEqual(store.enqueue((entry(i) for i in range(4990, 5003)), options, only_new=True), 2)
         self.assertEqual([job.entry.index for job in store.jobs()], list(range(1, 5003)))
 
+    def test_filter_adds_only_visible_checked_rows(self):
+        self.send_page(1, 21, {"kind": "done"})
+        self.window.preview_search.setText("film 2")
+        self.assertEqual(self.window.preview_filter.rowCount(), 2)
+        self.window.select_visible(False)
+        self.window.select_visible(True)
+        self.window.enqueue()
+        self.assertEqual([job.entry.index for job in self.controller.store.jobs()], [2, 20])
+        self.assertIn(0, self.window.preview_model.selected)
+        self.assertNotIn(1, self.window.preview_model.selected)
+
+    def test_music_preview_defaults_to_audio_without_changing_global_settings(self):
+        self.controller.cancel_scan()
+        self.window.source.setText("https://music.youtube.com/playlist?list=PLMusic")
+        self.window.preview()
+        self.send_page(1, 3, {"kind": "done"})
+        self.assertIs(self.window.preview_mode.currentData(), True)
+        self.window.enqueue()
+        self.assertTrue(all(job.options.audio_only for job in self.controller.store.jobs()))
+        self.assertFalse(self.controller.prefs.options.audio_only)
+
 
 if __name__ == "__main__":
     unittest.main()

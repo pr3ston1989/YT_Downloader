@@ -19,6 +19,7 @@ class Source:
     kind: str
     url: str
     tab: str | None = None
+    music: bool = False
 
 
 def parse_source(text: str) -> Source:
@@ -36,29 +37,45 @@ def parse_source(text: str) -> Source:
         raise ValueError("Podaj prawidłowy link do YouTube.")
     query = parse_qs(url.query)
     parts = url.path.strip("/").split("/")
+    music = host == "music.youtube.com"
+    media_host = "music.youtube.com" if music else "www.youtube.com"
+    watch_id = query.get("v", [""])[0]
     playlist = query.get("list", [""])[0]
-    if re.fullmatch(r"[A-Za-z0-9_-]+", playlist):
-        return Source("playlist", f"https://www.youtube.com/playlist?list={playlist}")
+    if music and len(parts) == 2 and parts[0] == "browse":
+        browse_id = parts[1]
+        if re.fullmatch(r"MPRE[A-Za-z0-9_-]+", browse_id):
+            return Source("album", f"https://{media_host}/browse/{browse_id}", music=True)
+        if re.fullmatch(r"VL[A-Za-z0-9_-]+", browse_id):
+            playlist = browse_id[2:]
+        elif re.fullmatch(r"UC[A-Za-z0-9_-]{22}", browse_id):
+            parts = ["channel", browse_id]
+        else:
+            raise ValueError("W YouTube Music otwórz konkretny utwór, album, playlistę lub stronę wykonawcy.")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", playlist) and not (
+            music and parts[0] == "watch" and playlist.startswith("RD") and VIDEO_ID.fullmatch(watch_id)):
+        is_album = playlist.startswith("OLAK5uy_")
+        return Source("album" if is_album else "playlist", f"https://{media_host}/playlist?list={playlist}",
+                      music=music or is_album)
     if host == "youtu.be":
         video = parts[0]
     elif parts[0] == "watch":
-        video = query.get("v", [""])[0]
+        video = watch_id
     elif parts[0] in ("shorts", "live", "embed", "v") and len(parts) == 2:
         video = parts[1]
     else:
         video = ""
     if VIDEO_ID.fullmatch(video):
-        return Source("video", f"https://www.youtube.com/watch?v={video}")
+        return Source("video", f"https://{media_host}/watch?v={video}", music=music)
     if host != "youtu.be" and parts[0].startswith("@"):
         base, suffix = parts[:1], parts[1:]
     elif host != "youtu.be" and parts[0] in ("channel", "c", "user") and len(parts) >= 2:
         base, suffix = parts[:2], parts[2:]
     else:
-        raise ValueError("Podaj link do filmu, playlisty lub kanału YouTube.")
+        raise ValueError("Podaj link do filmu, playlisty, kanału lub albumu YouTube Music.")
     if any(not part or part in (".", "..") or "\\" in part for part in base):
         raise ValueError("Nieprawidłowy adres kanału.")
     return Source("channel", "https://www.youtube.com/" + "/".join(base),
-                  suffix[0] if suffix and suffix[0] in CHANNEL_TABS else None)
+                  suffix[0] if suffix and suffix[0] in CHANNEL_TABS else None, music=music)
 
 
 @dataclass(frozen=True)
@@ -70,6 +87,14 @@ class Entry:
     index: int = 1
     duration: int | None = None
     tab: str = ""
+    music: bool = False
+    album: str = ""
+    track_number: int | None = None
+
+    @property
+    def url(self):
+        host = "music.youtube.com" if self.music else "www.youtube.com"
+        return f"https://{host}/watch?v={self.id}"
 
 
 @dataclass
@@ -149,7 +174,7 @@ def safe_segment(value: str, limit: int = 100) -> str:
 def output_stem(entry: Entry, options: Options, job_id: int) -> Path:
     values = {
         "channel": safe_segment(entry.channel or "YouTube", 60),
-        "playlist": safe_segment(entry.playlist or "Filmy", 60),
+        "playlist": safe_segment(entry.playlist or ("Utwory" if entry.music else "Filmy"), 60),
         "index": f"{entry.index:02d}",
         "title": safe_segment(entry.title, 95),
         "id": entry.id,

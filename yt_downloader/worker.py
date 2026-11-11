@@ -51,10 +51,14 @@ def explain(error, *, source_kind=None):
     text = str(error).casefold()
     if "playlist is private" in text or "private playlist" in text:
         return "auth", "Playlista jest prywatna. Zaloguj się na konto z dostępem do niej."
-    if source_kind == "playlist" and any(message in text for message in (
+    if source_kind in ("playlist", "album") and any(message in text for message in (
             "playlist does not exist", "playlist is not available", "playlist is unavailable",
             "playlist is not accessible")):
         return "playlist_access", "Playlista jest niedostępna. Jeśli jest prywatna, zaloguj się na konto z dostępem."
+    if re.search(r"channel does not have an? (videos|shorts|streams|live) tab", text):
+        return "missing_tab", "Kanał nie ma wybranej zakładki."
+    if source_kind == "channel" and "playlist does not exist" in text:
+        return "unavailable", "YouTube nie udostępnia listy przesłanych materiałów tego kanału."
     patterns = (
         ("auth", "Film ma ograniczenie wiekowe. Zaloguj się na konto z dostępem do materiałów 18+.",
          ("age-restricted", "age restriction", "confirm your age", "verify your age",
@@ -73,7 +77,8 @@ def explain(error, *, source_kind=None):
           "incomplete data received")),
         ("extractor", "Silnik nie odczytał strumieni YouTube.",
          ("unable to extract", "http error 403", "signature extraction", "nsig", "challenge solving",
-          "no video formats", "only images are available", "not available on this app")),
+          "no video formats", "only images are available", "not available on this app",
+          "failed to resolve album to playlist", "unable to download format")),
         ("format", "Film nie ma formatu pasującego do wybranych ustawień.",
          ("requested format is not available", "no matching format")),
         ("disk", "Nie można zapisać pliku. Sprawdź dostęp i wolne miejsce.",
@@ -132,6 +137,10 @@ def base_parameters(request, logger):
 def scan(ydl, request, parameters, emit):
     source = request["source"]
     single = source["kind"] == "video"
+    music = source.get("music", False)
+    album_source = source["kind"] == "album"
+    artist_channel = (re.fullmatch(r"https://www\.youtube\.com/channel/UC([A-Za-z0-9_-]{22})", source["url"])
+                      if music else None)
     tabs = request["tabs"] if source["kind"] == "channel" else [""]
     settings = {
         **parameters,
@@ -154,20 +163,37 @@ def scan(ydl, request, parameters, emit):
             with ydl(settings) as client:
                 # Processing a playlist in YoutubeDL returns entries only after exhausting
                 # the continuation iterator. Read that iterator directly for the preview.
-                info = client.extract_info(url, download=False, process=single)
+                try:
+                    info = client.extract_info(url, download=False, process=single)
+                except Exception as exc:
+                    if not (tab == "videos" and artist_channel
+                            and "channel does not have a videos tab" in str(exc).casefold()):
+                        raise
+                    uploads = f"https://www.youtube.com/playlist?list=UU{artist_channel[1]}"
+                    info = client.extract_info(uploads, download=False, process=False)
+                if album_source and info.get("_type") == "url":
+                    info = client.extract_info(info["url"], ie_key=info.get("ie_key"), download=False, process=False)
                 if info.get("_type") in ("url", "url_transparent"):
                     info = client.process_ie_result(info, download=False)
+                collection = "" if single else info.get("title") or ""
+                owner = info.get("channel") or info.get("uploader") or ""
+                if album_source:
+                    collection = (info.get("album") or collection).removeprefix("Album - ")
                 entries = info.get("entries", (info,))
                 for index, entry in enumerate(() if entries is None else entries, 1):
                     video_id = entry.get("id") if entry else None
                     if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
                         continue
+                    number = entry.get("playlist_index") or index
+                    album = (entry.get("album") or (collection if album_source else "")) if music else ""
+                    title = (entry.get("track") if music else None) or entry.get("title") or video_id
+                    channel = (entry.get("artist") if music else None) or entry.get("channel") or entry.get("uploader")
+                    track_number = entry.get("track_number") or (number if album_source else None)
                     item = Entry(
-                        video_id, entry.get("title") or video_id,
-                        entry.get("channel") or entry.get("uploader")
-                        or info.get("channel") or info.get("uploader") or "",
-                        info.get("title") or "" if not single else "",
-                        entry.get("playlist_index") or index, entry.get("duration"), tab,
+                        id=video_id, title=title,
+                        channel=(owner or "YouTube Music") if album_source else channel or owner,
+                        playlist=collection or album, index=number, duration=entry.get("duration"),
+                        tab=tab, music=music, album=album, track_number=track_number,
                     )
                     emit("entry", entry=asdict(item))
                     count += 1
@@ -175,7 +201,8 @@ def scan(ydl, request, parameters, emit):
             if source["kind"] != "channel" or len(tabs) == 1:
                 raise
             last_error = exc
-            emit("scan_warning", tab=tab, message=explain(exc)[1])
+            code, message = explain(exc, source_kind=source["kind"])
+            emit("scan_warning", tab=tab, code=code, message=message)
     if not count and last_error:
         raise last_error
     emit("done", count=count)
@@ -213,6 +240,20 @@ def add_audio_encoder(client, options):
             return ([] if source == target else [str(source)]), info
 
     client.add_post_processor(EncodeAudio(client))
+
+
+def add_album_metadata(client, entry):
+    from yt_dlp.postprocessor.common import PostProcessor
+
+    class AlbumMetadata(PostProcessor):
+        def run(self, info):
+            if entry.album and not info.get("album"):
+                info["album"] = entry.album
+            if entry.track_number and not info.get("track_number"):
+                info["track_number"] = entry.track_number
+            return [], info
+
+    client.add_post_processor(AlbumMetadata(client), when="pre_process")
 
 
 def download(ydl, request, parameters, emit):
@@ -280,7 +321,11 @@ def download(ydl, request, parameters, emit):
         "progress_hooks": [progress],
         "postprocessor_hooks": [processing],
     }
+    if entry.music:
+        settings.update(check_formats="selected", paths={"temp": tempfile.gettempdir()})
     with ydl(settings) as client:
+        if options.metadata and entry.music and (entry.album or entry.track_number):
+            add_album_metadata(client, entry)
         if options.audio_only:
             add_audio_encoder(client, options)
         for processor in post:
@@ -288,7 +333,7 @@ def download(ydl, request, parameters, emit):
             key = args.pop("key")
             when = args.pop("when", "post_process")
             client.add_post_processor(get_postprocessor(key)(client, **args), when=when)
-        client.extract_info(f"https://www.youtube.com/watch?v={entry.id}", download=True)
+        client.extract_info(entry.url, download=True)
     if not final.is_file() or not final.stat().st_size:
         raise OSError("Nie powstał końcowy plik multimedialny.")
     emit("done", path=str(final))

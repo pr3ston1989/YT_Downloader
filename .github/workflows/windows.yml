@@ -29,8 +29,11 @@ jobs:
           python -m unittest discover -s tests -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\packaging\build.ps1 -Python python
-      - name: Test pagination with the verified yt-dlp engine
-        run: python -m unittest discover -s tests -p test_pagination.py -v
+      - name: Test pagination and audio with the verified media tools
+        run: |
+          python -m unittest discover -s tests -p test_pagination.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_music.py -v
       - name: Install and smoke test
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
