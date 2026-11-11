@@ -14,7 +14,7 @@ class QueueTests(unittest.TestCase):
     def setUp(self):
         workspace = tempfile.TemporaryDirectory()
         self.addCleanup(workspace.cleanup)
-        self.root = Path(workspace.name)
+        self.root = Path(workspace.name).resolve()
         self.store = Store(self.root)
         self.addCleanup(self.store.close)
         self.entry = Entry("jNQXAC9IVRw", "Przykład")

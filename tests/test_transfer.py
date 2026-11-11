@@ -66,7 +66,7 @@ class TransferTests(unittest.TestCase):
         if not runtime.ready:
             self.skipTest("The Windows build prepares the verified media tools.")
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             media = root / "fixture.mp4"
             subprocess.run([Path(runtime.ffmpeg) / "ffmpeg.exe", "-v", "error", "-f", "lavfi",
                             "-i", "color=size=32x32:duration=0.2", "-pix_fmt", "yuv420p", media],
