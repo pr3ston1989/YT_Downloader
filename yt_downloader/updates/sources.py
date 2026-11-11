@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
+import time
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -11,7 +11,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 SHA256 = re.compile(r"[a-fA-F0-9]{64}")
 API = "https://api.github.com/repos"
 GITHUB = "https://github.com"
-FFMPEG = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 
 class HTTPSRedirect(HTTPRedirectHandler):
@@ -46,8 +45,11 @@ class Http:
             raise ValueError("Brak prawidłowej sumy SHA-256.")
         hashed = hashlib.sha256()
         length = 0
+        deadline = time.monotonic() + 180
         with self.open(url) as source, path.open("wb") as target:
             while chunk := source.read(1024 * 1024):
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Przekroczono czas pobierania aktualizacji.")
                 length += len(chunk)
                 if length > 450 * 1024 * 1024:
                     raise ValueError("Paczka aktualizacji jest zbyt duża.")
@@ -87,6 +89,7 @@ def github_package(http, component, repo, name, channel="stable", sums=None):
     tag = release["tag_name"]
     if not re.fullmatch(r"[A-Za-z0-9._-]+", tag) or tag in (".", ".."):
         raise ValueError("Nieprawidłowy identyfikator wydania.")
+    name = name.format(tag=tag)
     assets = {asset["name"]: asset for asset in release["assets"]}
     base = f"{GITHUB}/{repo}/releases/download/{tag}"
     if name not in assets or (sums and sums not in assets):
@@ -104,9 +107,5 @@ def latest(http: Http, component: str, channel="stable"):
     if component == "deno":
         return github_package(http, component, "denoland/deno", "deno-x86_64-pc-windows-msvc.zip")
     if component == "ffmpeg":
-        version = http.text(FFMPEG + ".ver").strip()
-        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version):
-            raise ValueError("Nieprawidłowa wersja FFmpeg.")
-        return Package(component, version, "stable", FFMPEG, "ffmpeg-release-essentials.zip",
-                       FFMPEG + ".sha256")
+        return github_package(http, component, "GyanD/codexffmpeg", "ffmpeg-{tag}-essentials_build.zip")
     raise ValueError(f"Nieznany komponent {component}.")

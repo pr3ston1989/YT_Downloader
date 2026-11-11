@@ -1,9 +1,11 @@
 from dataclasses import asdict
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 
 from .auth import crypt
@@ -18,6 +20,7 @@ def load_engine(path):
     standard_library = RESOURCES / "runtime-stdlib.zip"
     if standard_library.is_file():
         sys.path.append(str(standard_library))
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(root))
     from yt_dlp import YoutubeDL
     return YoutubeDL
@@ -161,7 +164,31 @@ def format_expression(options):
     return default
 
 
+def add_audio_encoder(client, options):
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+
+    class EncodeAudio(FFmpegPostProcessor):
+        def run(self, info):
+            extension = options.audio_format
+            encoder = {"mp3": "libmp3lame", "m4a": "aac", "opus": "libopus"}[extension]
+            source = Path(info["filepath"])
+            target = source.with_suffix(f".{extension}")
+            stage = target.with_name(f"{target.stem}.encode.{extension}")
+            flags = ["-map", "0:a:0", "-vn", "-c:a", encoder, "-b:a", f"{options.bitrate}k"]
+            if extension == "opus":
+                flags.extend(("-vbr", "off"))
+            self.run_ffmpeg(str(source), str(stage), flags)
+            os.replace(stage, target)
+            info["filepath"] = str(target)
+            info["ext"] = extension
+            return ([] if source == target else [str(source)]), info
+
+    client.add_post_processor(EncodeAudio(client))
+
+
 def download(ydl, request, parameters, emit):
+    from yt_dlp.postprocessor import get_postprocessor
+
     entry = Entry(**request["entry"])
     options = Options(**request["options"])
     options.validate()
@@ -170,14 +197,10 @@ def download(ydl, request, parameters, emit):
     extension = options.audio_format if options.audio_only else options.container
     final = Path(f"{stem}.{extension}")
     last_update = 0.0
-    last_stream = None
     streams_done = 0
 
     def progress(data):
-        nonlocal last_update, last_stream, streams_done
-        stream = data.get("filename")
-        if stream != last_stream:
-            last_stream = stream
+        nonlocal last_update, streams_done
         now = time.monotonic()
         total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
         if data["status"] == "finished":
@@ -192,13 +215,10 @@ def download(ydl, request, parameters, emit):
 
     def processing(data):
         if data["status"] == "started":
-            emit("processing")
+            emit("processing", speed=None, eta=None)
 
     post = []
-    if options.audio_only:
-        post.append({"key": "FFmpegExtractAudio", "preferredcodec": extension,
-                     "preferredquality": str(options.bitrate)})
-    else:
+    if not options.audio_only:
         post.append({"key": "FFmpegVideoRemuxer", "preferedformat": extension})
     if options.subtitles:
         post.append({"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
@@ -206,12 +226,15 @@ def download(ydl, request, parameters, emit):
             post.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
     if options.metadata:
         post.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
+    if options.thumbnail:
+        post.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
     languages = [re.escape(lang.strip()) + r"(?:[-_].*)?"
                  for lang in options.subtitle_languages.split(",") if lang.strip()]
     settings = {
         **parameters,
         "format": format_expression(options),
         "merge_output_format": options.container,
+        "final_ext": extension,
         "outtmpl": str(stem).replace("%", "%%") + ".%(ext)s",
         "noplaylist": True,
         "windowsfilenames": True,
@@ -226,9 +249,15 @@ def download(ydl, request, parameters, emit):
         "subtitleslangs": languages,
         "progress_hooks": [progress],
         "postprocessor_hooks": [processing],
-        "postprocessors": post,
     }
     with ydl(settings) as client:
+        if options.audio_only:
+            add_audio_encoder(client, options)
+        for processor in post:
+            args = dict(processor)
+            key = args.pop("key")
+            when = args.pop("when", "post_process")
+            client.add_post_processor(get_postprocessor(key)(client, **args), when=when)
         client.extract_info(f"https://www.youtube.com/watch?v={entry.id}", download=True)
     if not final.is_file() or not final.stat().st_size:
         raise OSError("Nie powstał końcowy plik multimedialny.")
@@ -237,6 +266,7 @@ def download(ydl, request, parameters, emit):
 
 def run_worker(work):
     work = Path(work)
+    tempfile.tempdir = str(work)
     request_path = work / "request.json"
     for _ in range(150):
         if request_path.is_file():

@@ -53,7 +53,7 @@ class Controller(QObject):
     login_needed = Signal()
     update_ready = Signal(object)
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, smoke=False):
         super().__init__()
         self.root = root
         self.store = Store(root)
@@ -62,6 +62,7 @@ class Controller(QObject):
         self.active = {}
         self.scan = None
         self.pending_repairs = {}
+        self.smoke = smoke
         self.future = None
         self.next_check = time.time()
         self.manual_check = False
@@ -112,7 +113,7 @@ class Controller(QObject):
                     try:
                         last = db.get("last_check", 0)
                         due = time.time() - last >= CHECK_INTERVAL
-                        if mode == "manual" or not self.manager.snapshot().ready or auto and due:
+                        if not self.smoke and (mode == "manual" or not self.manager.snapshot().ready or auto and due):
                             for component in COMPONENTS:
                                 self.manager.check(component, selected if component == "yt-dlp" else "stable")
                             if auto or mode == "manual":
@@ -158,7 +159,7 @@ class Controller(QObject):
                 message = ("Zależności są gotowe. Wyniki sprawdzenia znajdziesz w historii aktualizacji."
                            if ready else "Brakuje zależności. Aplikacja ponowi próbę automatycznie.")
                 self.message.emit(message)
-        if candidate and not self.install_pending:
+        if candidate and not self.install_pending and (self.prefs.auto_update or mode == "manual"):
             self.install_pending = candidate
             self.message.emit("Pobrano nową wersję. Aplikacja zrestartuje się po aktywnych zadaniach.")
         self.changed.emit()
@@ -246,7 +247,7 @@ class Controller(QObject):
             self.changed.emit()
         else:
             self.scanned.emit({**event, "entries": scan.entries, "warnings": scan.warnings})
-        if event.get("code") == "auth":
+        if event.get("code") in ("auth", "cookies"):
             self.login_needed.emit()
 
     def recovery_channel(self, recovery):
@@ -288,6 +289,9 @@ class Controller(QObject):
             self.store.state(job.id, "queued", f"Ponowienie za {delay} s. {reason}", delay=delay,
                              attempts=job.attempts + 1)
         elif code == "extractor" and self.prefs.auto_update and job.recovery < 2:
+            if item.engine_version != self.manager.snapshot().version:
+                self.store.state(job.id, "queued", recovery=job.recovery + 1)
+                return
             self.store.state(job.id, "repair", reason, recovery=job.recovery + 1)
             self.pending_repairs[job.id] = self.recovery_channel(job.recovery)
         elif code in ("auth", "cookies"):
@@ -349,7 +353,7 @@ class Controller(QObject):
             elif self.manual_check:
                 self.manual_check = False
                 self.update("manual")
-            elif time.time() >= self.next_check and (
+            elif not self.smoke and time.time() >= self.next_check and (
                     self.prefs.auto_update or not self.manager.snapshot().ready):
                 self.update("routine")
         if not self.manager.snapshot().ready:
@@ -358,6 +362,7 @@ class Controller(QObject):
             self.preview(parse_source(row["url"]), json.loads(row["tabs"]), dict(row))
         if self.paused or self.install_pending or any(item.stopped for item in self.active.values()):
             return
+        changed = self.store.skip_downloaded()
         while len(self.active) < self.prefs.parallel:
             job = self.store.claim()
             if not job:
@@ -370,6 +375,8 @@ class Controller(QObject):
             except Exception:
                 LOG.exception("Nie udało się uruchomić zadania %s", job.id)
                 self.store.state(job.id, "failed", "Nie udało się uruchomić procesu pobierania.")
+            changed = True
+        if changed:
             self.changed.emit()
 
     def close(self):

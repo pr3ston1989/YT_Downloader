@@ -69,6 +69,8 @@ def read_result(root, record):
         record("aplikacja", data["version"], data["status"], data["detail"])
     except FileNotFoundError:
         return
+    except (ValueError, KeyError, OSError) as exc:
+        record("aplikacja", "", "błąd odczytu wyniku", str(exc))
     finally:
         path.unlink(missing_ok=True)
 

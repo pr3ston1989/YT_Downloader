@@ -70,7 +70,7 @@ class Store:
             for entry in entries:
                 if only_new and self.db.execute("""
                     SELECT id FROM downloads WHERE id=?
-                    UNION ALL SELECT video_id FROM jobs WHERE video_id=? AND state!='skipped'
+                    UNION ALL SELECT video_id FROM jobs WHERE video_id=? AND state NOT IN ('skipped','failed')
                 """, (entry.id, entry.id)).fetchone():
                     continue
                 self.db.execute("INSERT INTO jobs (video_id,entry,options) VALUES (?,?,?)",
@@ -86,21 +86,25 @@ class Store:
     def jobs(self):
         return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY id")]
 
+    def skip_downloaded(self):
+        with self.db:
+            return self.db.execute("""
+                UPDATE jobs SET state='skipped', reason=? WHERE state='queued'
+                    AND NOT json_extract(options, '$.force')
+                    AND EXISTS (SELECT 1 FROM downloads WHERE id=jobs.video_id)
+            """, ("Film jest już w historii.",)).rowcount
+
     def claim(self):
         with self.db:
-            while row := self.db.execute("""
-                SELECT j.*, d.id AS downloaded FROM jobs j LEFT JOIN downloads d ON d.id=j.video_id
+            row = self.db.execute("""
+                SELECT j.* FROM jobs j
                 WHERE j.state='queued' AND j.ready<=?
                     AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
                 ORDER BY j.id LIMIT 1
-            """, (time.time(),)).fetchone():
-                job = self.job(row)
-                if row["downloaded"] and not job.options.force:
-                    self.db.execute("UPDATE jobs SET state='skipped', reason=? WHERE id=?",
-                                    ("Film jest już w historii.", job.id))
-                    continue
-                self.db.execute("UPDATE jobs SET state='running', reason='' WHERE id=?", (job.id,))
-                return job
+            """, (time.time(),)).fetchone()
+            if row:
+                self.db.execute("UPDATE jobs SET state='running', reason='' WHERE id=?", (row["id"],))
+                return self.job(row)
         return None
 
     def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None):

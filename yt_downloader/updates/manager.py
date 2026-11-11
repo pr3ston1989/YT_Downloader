@@ -9,7 +9,7 @@ from threading import Lock
 from uuid import uuid4
 import zipfile
 
-from ..runtime import HIDE_WINDOW, RESOURCES, atomic_json, command, external_env
+from ..runtime import FROZEN, HIDE_WINDOW, RESOURCES, atomic_json, command, external_env
 from .sources import Http, Package, latest
 
 
@@ -97,7 +97,7 @@ def verify(component, root, expected=""):
 class EngineManager:
     def __init__(self, root: Path, record=lambda *args: None, *, seed=None, http=None, probe=verify):
         self.root = root
-        self.seed = seed if seed is not None else RESOURCES / "seed"
+        self.seed = seed if seed is not None else RESOURCES / ("seed" if FROZEN else "vendor/seed")
         self.record = record
         self.http = http if http is not None else Http()
         self.probe = probe
@@ -142,12 +142,16 @@ class EngineManager:
         directory = self.root / component
         directory.mkdir(parents=True, exist_ok=True)
         candidate = {"version": version, "channel": channel, "folder": uuid4().hex}
-        with tempfile.TemporaryDirectory(dir=directory) as temporary:
-            stage = Path(temporary) / "payload"
-            stage.mkdir()
+        stage = directory / candidate["folder"]
+        stage.mkdir()
+        # Until active.json is replaced, this directory is invisible to new tasks.
+        # Keeping its name stable avoids renaming freshly executed EXEs on Windows.
+        try:
             populate(stage)
             self.probe(component, stage, version)
-            stage.replace(directory / candidate["folder"])
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
         return candidate
 
     def install(self, package: Package):
@@ -157,9 +161,10 @@ class EngineManager:
             return False
 
         def populate(stage):
-            downloaded = stage.parent / "package"
-            self.http.fetch(package.url, downloaded, package.checksum(self.http))
-            extract(downloaded, stage, component)
+            with tempfile.TemporaryDirectory(dir=stage.parent) as temporary:
+                downloaded = Path(temporary) / "package"
+                self.http.fetch(package.url, downloaded, package.checksum(self.http))
+                extract(downloaded, stage, component)
 
         try:
             candidate = self.stage(component, package.version, package.channel, populate)
@@ -197,6 +202,7 @@ class EngineManager:
                         candidate = self.stage(component, seed["version"], seed["channel"],
                                                lambda path: shutil.copytree(
                                                    self.seed / component / seed["folder"], path,
+                                                   ignore=shutil.ignore_patterns("__pycache__"),
                                                    dirs_exist_ok=True))
                         self.publish(component, candidate)
                         self.record(component, seed["version"], "przywrócono", "Kopia z instalatora.")
@@ -215,6 +221,11 @@ class EngineManager:
     def check(self, component, channel="stable"):
         try:
             package = latest(self.http, component, channel)
+            active = self.snapshot()
+            if (component == "yt-dlp" and channel == "stable" and active.channel == "nightly"
+                    and tuple(map(int, package.version.split(".")[:3]))
+                    <= tuple(map(int, active.version.split(".")[:3]))):
+                return False
             return self.install(package)
         except Exception as exc:
             self.record(component, "", "błąd sprawdzania", str(exc))

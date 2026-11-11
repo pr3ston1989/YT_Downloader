@@ -9,7 +9,7 @@ from yt_downloader.updates.manager import EngineManager, extract
 from yt_downloader.updates.sources import Http, Package
 
 
-def package(version, content=None):
+def package(version):
     name = "yt-dlp"
     return Package(name, version, "stable", "https://test.invalid/asset", name,
                    "https://test.invalid/SHA2-256SUMS")

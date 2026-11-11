@@ -93,6 +93,10 @@ class Options:
     def validate(self):
         if not Path(self.folder).is_absolute():
             raise ValueError("Wybierz bezwzględną ścieżkę do folderu pobierania.")
+        if self.audio_language and not re.fullmatch(r"[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]+)*", self.audio_language):
+            raise ValueError("Podaj kod języka audio, np. pl lub en-US.")
+        if self.subtitles and not any(language.strip() for language in self.subtitle_languages.split(",")):
+            raise ValueError("Podaj przynajmniej jeden język napisów.")
         validate_template(self.template)
 
 
@@ -122,7 +126,7 @@ def validate_template(template: str):
     parts = template.replace("\\", "/").split("/")
     if not all(part and part not in (".", "..") for part in parts):
         raise ValueError("Szablon musi być ścieżką względną w folderze pobierania.")
-    if not template.endswith(".{ext}") or any("{ext}" in part for part in parts[:-1]):
+    if not template.endswith(".{ext}") or template.count("{ext}") != 1:
         raise ValueError("Zakończ nazwę pliku polem .{ext}.")
     try:
         for part in parts:
