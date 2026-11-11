@@ -143,7 +143,7 @@ def scan(ydl, request, parameters, emit):
     if not single:
         settings.update(
             extractor_retries=3,
-            retry_sleep_functions={"extractor": lambda attempt: min(2 ** (attempt - 1), 8)},
+            retry_sleep_functions={"extractor": lambda n: min(2 ** n, 8)},
             extractor_args={"youtube": {"raise_incomplete_data": ["1"]}},
         )
     count = 0

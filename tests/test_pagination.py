@@ -1,6 +1,8 @@
 from dataclasses import asdict
+from io import BytesIO
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -10,8 +12,8 @@ from PySide6.QtWidgets import QApplication
 from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, parse_source
 from yt_downloader.ui import Window
-from yt_downloader.updates import Runtime
-from yt_downloader.worker import scan
+from yt_downloader.updates import EngineManager, Runtime
+from yt_downloader.worker import load_engine, scan
 
 
 PLAYLIST = "https://www.youtube.com/playlist?list=PLTest"
@@ -42,11 +44,54 @@ class PaginationWorkerTests(unittest.TestCase):
         client.extract_info.assert_called_once_with(PLAYLIST, download=False, process=False)
         settings = ydl.call_args.args[0]
         self.assertEqual(settings["extractor_retries"], 3)
-        self.assertEqual(settings["retry_sleep_functions"]["extractor"](3), 4)
+        self.assertEqual(settings["retry_sleep_functions"]["extractor"](n=2), 4)
         self.assertEqual(settings["extractor_args"]["youtube"]["raise_incomplete_data"], ["1"])
         self.assertEqual([values["entry"]["index"] for kind, values in events if kind == "entry"],
                          list(range(1, 351)))
         self.assertEqual(events[-1], ("done", {"count": 350}))
+
+
+class PaginationEngineTests(unittest.TestCase):
+    def test_verified_engine_retries_errors_and_rejects_an_incomplete_page(self):
+        root = Path(__file__).resolve().parents[1] / "vendor" / "seed"
+        engine = EngineManager(root)
+        engine.refresh()
+        if not engine.snapshot().engine:
+            self.skipTest("The Windows build prepares the verified engine.")
+
+        capture = MagicMock()
+        capture.return_value.__enter__.return_value.extract_info.return_value = {"entries": []}
+        scan(capture, {"source": asdict(parse_source(PLAYLIST))}, {}, lambda *args, **kwargs: None)
+        settings = capture.call_args.args[0]
+        retry = settings["retry_sleep_functions"]["extractor"]
+        delays = []
+
+        def record_retry(*, n):
+            delays.append(retry(n=n))
+            return 0
+
+        settings["retry_sleep_functions"]["extractor"] = record_retry
+        settings.update(quiet=True, plugin_dirs=[], logger=MagicMock())
+        with (patch.object(sys, "path", sys.path.copy()), patch.object(sys, "dont_write_bytecode")):
+            ydl = load_engine(engine.snapshot().engine)
+            from yt_dlp.networking import Response
+            from yt_dlp.networking.exceptions import HTTPError
+            from yt_dlp.utils import ExtractorError
+
+            with ydl(settings) as client:
+                tab = client.get_info_extractor("YoutubeTab")
+                response = Response(BytesIO(), PLAYLIST, headers={}, status=503)
+                fault = ExtractorError("HTTP 503", cause=HTTPError(response))
+                page = {"continuationContents": {"items": ["page result"]}}
+                with patch.object(tab, "_call_api", side_effect=[fault, {}, page]) as api:
+                    result = tab._extract_response("fixture page 2", {}, check_get_keys="continuationContents")
+                    self.assertEqual(result, page)
+                    self.assertEqual(api.call_count, 3)
+                    self.assertEqual(delays, [1, 1])
+                with patch.object(tab, "_call_api", return_value={}) as api:
+                    with self.assertRaisesRegex(ExtractorError, "Incomplete data received"):
+                        tab._extract_response("fixture page 3", {}, check_get_keys="continuationContents")
+                    self.assertEqual(api.call_count, 4)
 
 
 class PaginationPreviewTests(unittest.TestCase):
