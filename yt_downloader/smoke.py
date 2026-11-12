@@ -1,6 +1,7 @@
 """Fixed queue scenario for the packaged application's Windows smoke test."""
 
 import logging
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
 
@@ -43,11 +44,23 @@ def assert_saved_queue(window):
     assert all(job.options == window.download_profiles[PROFILE] for job in jobs)
 
 
-def resume_queue(window):
+def interrupt_queue(window):
     assert window.c.paused, "The paused queue was not restored"
     assert_saved_queue(window)
     window.tabs.setCurrentWidget(window.queue_tab)
     window.pause_all.click()
+    folder = Path(window.download_profiles[PROFILE].folder) / URGENT_CHANNEL
+    while True:
+        jobs = window.c.store.jobs()
+        assert all(job.state not in ("failed", "auth", "done") for job in jobs), [(job.id, job.reason) for job in jobs]
+        if any(path.stat().st_size >= 65536 for path in folder.glob("*.part")):
+            assert jobs[0].entry.id == URGENT and jobs[0].state == "running"
+            return
+        yield
+
+
+def resume_queue(window):
+    assert not window.c.paused, "The active queue was not restored"
     while True:
         jobs = window.c.store.jobs()
         assert all(job.state not in ("failed", "auth") for job in jobs), [(job.id, job.reason) for job in jobs]
@@ -58,7 +71,7 @@ def resume_queue(window):
 
 
 def run_queue_smoke(app, window, phase):
-    scenario = {"prepare": prepare_queue, "resume": resume_queue}[phase](window)
+    scenario = {"prepare": prepare_queue, "interrupt": interrupt_queue, "resume": resume_queue}[phase](window)
 
     def advance():
         try:

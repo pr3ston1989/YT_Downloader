@@ -42,6 +42,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS downloads (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL, time REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS file_moves (
+                id INTEGER PRIMARY KEY, root TEXT NOT NULL, video_id TEXT NOT NULL, title TEXT NOT NULL,
+                files TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS updates (
                 time REAL NOT NULL, component TEXT NOT NULL, version TEXT NOT NULL,
                 status TEXT NOT NULL, detail TEXT NOT NULL
@@ -223,6 +227,26 @@ class Store:
 
     def history(self):
         return self.db.execute("SELECT * FROM downloads ORDER BY time DESC").fetchall()
+
+    def record_file_move(self, root, video_id, title, files):
+        with self.db:
+            return self.db.execute("INSERT INTO file_moves (root,video_id,title,files) VALUES (?,?,?,?)",
+                                   (str(root), video_id, title, json.dumps(files))).lastrowid
+
+    def pending_file_moves(self):
+        return self.db.execute("SELECT * FROM file_moves ORDER BY id").fetchall()
+
+    def finish_file_move(self, move_id, video_id, title, paths):
+        with self.db:
+            for source, target in paths:
+                self.db.execute("""
+                    INSERT INTO downloads (id,title,path,time) VALUES (?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET path=excluded.path
+                    WHERE downloads.path=? COLLATE NOCASE OR downloads.path=''
+                """, (video_id, title, target, time.time(), source))
+                self.db.execute("UPDATE jobs SET path=? WHERE video_id=? AND path=? COLLATE NOCASE",
+                                (target, video_id, source))
+            self.db.execute("DELETE FROM file_moves WHERE id=?", (move_id,))
 
     def import_archive(self, lines):
         ids = []

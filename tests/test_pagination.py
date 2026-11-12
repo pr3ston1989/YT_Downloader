@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, Options, detect_episode_numbers, output_stem, parse_source
-from yt_downloader.ui import MediaDetailsDialog, PreviewOptionsDialog, Window
+from yt_downloader.ui import MediaDetailsDialog, OrganizeDialog, PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
 from yt_downloader.worker import format_expression, inspect_media, load_engine, scan
 
@@ -202,6 +202,22 @@ class PaginationPreviewTests(unittest.TestCase):
         self.worker.poll.return_value = None if outcome is None else 1
         self.worker.events.return_value = events + ([outcome] if outcome else [])
         self.controller.poll_scan()
+
+    def test_organizing_from_the_playlist_preview_waits_for_confirmation(self):
+        self.send_page(1, 3, {"kind": "done"})
+        root = (self.controller.root / "downloads").resolve()
+        original = root / "Stary kanał" / f"Film [{entry(1).id}].mp4"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"fixture")
+        with patch("yt_downloader.ui.QFileDialog.getExistingDirectory", return_value=str(root)):
+            with patch.object(OrganizeDialog, "exec", return_value=QDialog.DialogCode.Rejected):
+                self.window.organize_button.click()
+            self.assertTrue(original.is_file())
+            with patch.object(OrganizeDialog, "exec", return_value=QDialog.DialogCode.Accepted):
+                self.window.organize_button.click()
+        target = root / "Playlista" / original.name
+        self.assertTrue(target.is_file())
+        self.assertEqual(self.controller.store.history()[0]["path"], str(target))
 
     def test_failed_page_keeps_visible_rows_and_allows_partial_enqueue(self):
         self.send_page(1, 101)

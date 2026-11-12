@@ -10,6 +10,7 @@ import time
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .model import Entry, Source, parse_source
+from .organize import recover_file_moves
 from .process import Worker
 from .store import Job, Store
 from .updates import EngineManager
@@ -63,6 +64,7 @@ class Controller(QObject):
         for path in (root / "workers").glob("worker-*"):
             shutil.rmtree(path, ignore_errors=True)
         self.store = Store(root)
+        recover_file_moves(self.store)
         self.prefs = self.store.preferences()
         self.manager = EngineManager(root / "engine", self.record)
         self.active = {}

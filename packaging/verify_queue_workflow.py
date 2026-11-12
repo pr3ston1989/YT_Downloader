@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -47,15 +49,25 @@ YoutubeDL = _QueueFixtureDL
 
 class MediaHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in (f"/{NORMAL}.mp4", f"/{URGENT}.mp4"):
+        if self.path not in self.server.payloads:
             self.send_error(404)
             return
-        self.server.requests.append(self.path)
-        self.send_response(200)
+        content = self.server.payloads[self.path]
+        offset = int(self.headers.get("Range", "bytes=0-").removeprefix("bytes=").split("-", 1)[0])
+        self.server.requests.append((self.path, offset))
+        self.send_response(206 if offset else 200)
         self.send_header("Content-Type", "video/mp4")
-        self.send_header("Content-Length", str(len(self.server.clip)))
+        self.send_header("Content-Length", str(len(content) - offset))
+        self.send_header("Accept-Ranges", "bytes")
+        if offset:
+            self.send_header("Content-Range", f"bytes {offset}-{len(content) - 1}/{len(content)}")
         self.end_headers()
-        self.wfile.write(self.server.clip)
+        try:
+            for start in range(offset, len(content), 16384):
+                self.wfile.write(content[start:start + 16384])
+                time.sleep(0.03)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass  # Expected when the application closes during the transfer.
 
     def log_message(self, *args):
         pass
@@ -137,7 +149,10 @@ def verify(executable):
                         "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5", "-c:v", "libx264", "-c:a", "aac", clip],
                        check=True, timeout=20, creationflags=HIDE_WINDOW)
         with ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler) as server:
-            server.clip = clip.read_bytes()
+            media = clip.read_bytes()
+            padding = b"\0" * (2 * 1024 * 1024)
+            urgent, normal = f"/{URGENT}.mp4", f"/{NORMAL}.mp4"
+            server.payloads = {normal: media, urgent: media + struct.pack(">I4s", len(padding) + 8, b"free") + padding}
             server.requests = []
             fixture = scratch / "media fixture.json"
             write_fixture(fixture, server.server_port)
@@ -148,9 +163,20 @@ def verify(executable):
                 subprocess.run([executable, "--smoke-test", root, "--queue-test", "prepare"],
                                check=True, timeout=95, env=env, creationflags=HIDE_WINDOW)
                 assert server.requests == [], "A download ran while the queue was paused"
+                subprocess.run([executable, "--smoke-test", root, "--queue-test", "interrupt"],
+                               check=True, timeout=95, env=env, creationflags=HIDE_WINDOW)
+                part, = (downloads / URGENT_CHANNEL).glob("*.part")
+                offset = part.stat().st_size
+                assert 65536 <= offset < len(server.payloads[urgent]), offset
+                assert server.requests == [(urgent, 0)], server.requests
+                with closing(Store(root)) as store:
+                    assert not store.get("queue_paused")
+                    assert [(job.entry.id, job.state) for job in store.jobs()] == [
+                        (URGENT, "queued"), (ARCHIVED, "skipped"), (NORMAL, "queued"),
+                    ]
                 subprocess.run([executable, "--smoke-test", root, "--queue-test", "resume"],
                                check=True, timeout=95, env=env, creationflags=HIDE_WINDOW)
-                assert server.requests == [f"/{URGENT}.mp4", f"/{NORMAL}.mp4"], server.requests
+                assert server.requests == [(urgent, 0), (urgent, offset), (normal, 0)], server.requests
                 verify_outputs(root, downloads, ffmpeg / "ffprobe.exe")
             except Exception:
                 log = root / "app.log"
@@ -159,7 +185,7 @@ def verify(executable):
                 raise
             finally:
                 server.shutdown()
-    print("Verified the installed playlist, profile, history skip, priority, restart and both MKV files.")
+    print("Verified playlist, profile, history, priority, active restart, HTTP Range resume and both MKV files.")
 
 
 if __name__ == "__main__":

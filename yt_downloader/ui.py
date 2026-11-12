@@ -31,6 +31,7 @@ from .model import (
     detect_episode_numbers, parse_source,
 )
 from .runtime import RESOURCES, atomic_bytes, command
+from .organize import apply_plan, make_plan
 from .updates.application import restart_for
 
 
@@ -562,6 +563,29 @@ class MediaDetailsDialog(QDialog):
         super().accept()
 
 
+class OrganizeDialog(QDialog):
+    def __init__(self, root, groups, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Plan uporządkowania plików")
+        self.resize(850, 460)
+        paths = TableModel(("Obecna ścieżka", "Ścieżka po przeniesieniu", "Stan"))
+        paths.replace([(str(path.relative_to(root)), str((group.target / path.name).relative_to(root)),
+                        group.status or "Do przeniesienia") for group in groups for path in group.files])
+        view = table(paths, 0)
+        view.setColumnWidth(1, 300)
+        view.setColumnWidth(2, 145)
+        count = sum(len(group.files) for group in groups if not group.status)
+        destination = QLabel(str(groups[0].target))
+        destination.setTextFormat(Qt.TextFormat.PlainText)
+        destination.setWordWrap(True)
+        move = button(f"Przenieś pliki ({count})", self.accept, primary=True)
+        move.setEnabled(count > 0)
+        layout = QVBoxLayout(self)
+        layout.addWidget(destination)
+        layout.addWidget(view, 1)
+        layout.addWidget(row(None, button("Zamknij", self.reject), move))
+
+
 class Window(QMainWindow):
     def __init__(self, app, controller):
         super().__init__()
@@ -574,6 +598,7 @@ class Window(QMainWindow):
         self.download_profiles = {name: Options(**values) for name, values in self.c.store.get("download_profiles", {}).items()}
         self.active_profile = None
         self.preview_music = False
+        self.preview_source = None
         self.login_url = ""
         self.quitting = False
         self.setWindowTitle(APP_NAME)
@@ -673,6 +698,8 @@ class Window(QMainWindow):
         self.add_button.setToolTip("Dodaj zaznaczone pozycje widoczne w podglądzie.")
         self.add_first = button("Pobierz następne", lambda: self.enqueue(first=True))
         self.add_first.setToolTip("Dodaj zaznaczone widoczne pozycje na początek kolejki. Ruszą w pierwszym wolnym miejscu.")
+        self.organize_button = button("Uporządkuj pliki…", self.organize_downloads)
+        self.organize_button.setToolTip("Dopasuj istniejące pliki do pozycji z playlisty i zobacz plan przeniesienia.")
         self.preview_search = QLineEdit()
         self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
         self.preview_search.textChanged.connect(self.filter_preview)
@@ -697,7 +724,7 @@ class Window(QMainWindow):
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
         layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button,
-                             self.add_first, self.add_button))
+                             self.organize_button, self.add_first, self.add_button))
         layout.addWidget(self.preview_table, 1)
         return page
 
@@ -875,6 +902,7 @@ class Window(QMainWindow):
         self.episode_order.setEnabled(False)
         self.preview_search.clear()
         self.preview_music = source.music
+        self.preview_source = source
         if not preserve_options:
             self.media_choices.clear()
             self.reset_preview_options()
@@ -927,6 +955,9 @@ class Window(QMainWindow):
         can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
         self.add_button.setEnabled(can_add)
         self.add_first.setEnabled(can_add)
+        playlist = self.preview_source is not None and self.preview_source.kind in ("playlist", "album")
+        self.organize_button.setVisible(playlist)
+        self.organize_button.setEnabled(playlist and self.preview_model.checkable and bool(self.preview_model.entries))
         entry = self.selected_media()
         self.media_details.setEnabled(entry is not None)
         self.media_details.setText("Wybrane formaty…" if entry and entry.id in self.media_choices else "Formaty i napisy…")
@@ -941,6 +972,36 @@ class Window(QMainWindow):
         if source.isValid() and source.row() < len(self.preview_model.entries):
             return self.preview_model.entries[source.row()]
         return None
+
+    def organize_downloads(self):
+        folder = QFileDialog.getExistingDirectory(self, "Folder ze starszymi pobraniami", self.options_for_preview().folder)
+        if not folder:
+            return
+        try:
+            root = Path(folder).resolve(strict=True)
+            groups = make_plan(root, self.preview_model.entries, self.c.store.history())
+        except (OSError, ValueError) as exc:
+            LOG.info("Plan porządkowania pobrań: %s", exc)
+            self.notify(str(exc) if isinstance(exc, ValueError) else "Nie można odczytać folderu z pobraniami.")
+            return
+        if not groups:
+            self.notify("W wybranym folderze nie znaleziono plików z tej playlisty.")
+            return
+        active = {item.job.entry.id for item in self.c.active.values()}
+        groups = [replace(group, status="Trwa pobieranie") if not group.status and group.video_id in active else group
+                  for group in groups]
+        dialog = OrganizeDialog(root, groups, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            active = {item.job.entry.id for item in self.c.active.values()}
+            moved, errors, busy = apply_plan(self.c.store, root, groups, active)
+            message = f"Przeniesiono plików: {moved}."
+            if errors:
+                message += f" Grupy z błędem: {errors}. Szczegóły są w logu."
+            if busy:
+                message += f" Pliki pominięte podczas pobierania: {busy}."
+            self.notify(message)
+            self.refresh()
+        dialog.deleteLater()
 
     def show_media_details(self):
         entry = self.selected_media()

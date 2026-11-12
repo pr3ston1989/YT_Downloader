@@ -43,6 +43,8 @@ W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja 
 
 Domyślny szablon to `{source}/{index} - {title} [{id}].{ext}`. Pole `{source}` tworzy jeden folder nazwany od otwartej playlisty, albumu lub kanału. Pojedynczy film trafia do folderu kanału. Po aktualizacji poprzedni domyślny szablon w ustawieniach zmieni się automatycznie. Rozpoczęte pobrania mogą wznowić się w swoim dotychczasowym folderze.
 
+Aby uporządkować wcześniejsze pliki, otwórz playlistę lub album i kliknij **Uporządkuj pliki…**. Wybierz folder, w którym znajdują się stare pobrania. Aplikacja dopasuje pliki po historii lub identyfikatorze `[ID]` w nazwie i pokaże plan przeniesienia do podfolderu z nazwą playlisty. Po zatwierdzeniu przenosi też pasujące napisy i pliki dodatkowe oraz aktualizuje historię. Konflikty nazw i pliki aktywnych pobrań są pomijane.
+
 Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{source}`, `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.
 
 Domyślnie aplikacja osadza metadane i miniaturę w pliku multimedialnym. MKV może też przechować pełny plik `.info.json` jako załącznik wewnątrz kontenera. Aby zapisywać osobne kopie w folderze pobrań, włącz **Zachowuj osobne pliki z miniaturą i metadanymi**. Ustawienie dotyczy nowych zadań. Pliki z wcześniejszych pobrań pozostają na dysku.
@@ -101,7 +103,7 @@ Testy podglądu sprawdzają kolejność wierszy z wielu stron, zachowanie częś
 
 Testy transferu zatrzymują osobny proces podczas pobierania z lokalnego serwera i porównują gotowy plik bajt po bajcie. Sprawdzają wznowienie oraz zmianę formatu w trakcie ponowienia. Test aktualizacji Windows sprawdza także zachowanie wstrzymanej kolejki po instalacji nowej wersji.
 
-Przed publikacją GitHub Actions uruchamia także zainstalowany program w izolowanym profilu. Test otwiera playlistę, wybiera zapisany profil, pomija wpis z historii i dodaje pilny film. Po restarcie wznawia kolejkę, sprawdza kolejność żądań do lokalnego serwera i weryfikuje oba pliki MKV za pomocą FFprobe.
+Przed publikacją GitHub Actions uruchamia także zainstalowany program w izolowanym profilu. Test otwiera playlistę, wybiera zapisany profil, pomija wpis z historii i dodaje pilny film. Zamyka aplikację w trakcie pobierania i uruchamia ją ponownie. Sprawdza, czy żądanie HTTP wznawia transfer dokładnie od końca pliku `.part` i czy oba pliki MKV przechodzą kontrolę FFprobe.
 
 ## Publikowanie nowej wersji
 
