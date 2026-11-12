@@ -51,10 +51,11 @@ def assert_saved_queue(window):
 
 
 def interrupt_queue(window):
-    assert window.c.paused, "The paused queue was not restored"
+    controller = window.c
+    assert controller.paused, "The paused queue was not restored"
     assert_saved_queue(window)
     window.tabs.setCurrentWidget(window.queue_tab)
-    package_id = window.c.store.jobs()[1].package_id
+    package_id = controller.store.jobs()[1].package_id
     assert controller.store.packages()[package_id].paused, "The playlist package pause was not restored"
     position = window.queue_model.package_rows[package_id][0]
     window.queue_table.selectRow(position)
