@@ -1,5 +1,6 @@
 import ctypes
 from ctypes import wintypes
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -70,7 +71,6 @@ class Worker:
         self.temp = tempfile.TemporaryDirectory(prefix="worker-", dir=directory, ignore_cleanup_errors=True)
         self.work = Path(self.temp.name)
         self.offset = 0
-        self.trailing = b""
         self.process = None
         self.windows_job = None
         try:
@@ -89,17 +89,17 @@ class Worker:
     def poll(self):
         return self.process.poll()
 
-    def events(self):
+    def events(self, limit=None):
         path = self.work / "events.jsonl"
         if not path.is_file():
             return
         with path.open("rb") as stream:
             stream.seek(self.offset)
-            chunk = stream.read()
-            self.offset += len(chunk)
-        *lines, self.trailing = (self.trailing + chunk).split(b"\n")
-        for line in lines:
-            yield json.loads(line)
+            for line in islice(stream, limit):
+                if not line.endswith(b"\n"):
+                    break
+                self.offset += len(line)
+                yield json.loads(line)
 
     def stop(self):
         if self.windows_job:

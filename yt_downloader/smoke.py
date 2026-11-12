@@ -74,6 +74,16 @@ def interrupt_queue(window):
 
 def resume_queue(window):
     assert not window.c.paused, "The active queue was not restored"
+    window.tabs.setCurrentWidget(window.queue_tab)
+    while window.c.store.jobs()[0].state != "running":
+        yield
+    window.finish_current.click()
+    assert window.c.paused, "The queue did not pause after current transfers"
+    while window.c.active:
+        yield
+    jobs = window.c.store.jobs()
+    assert [job.state for job in jobs] == ["done", "skipped", "queued"], jobs
+    window.pause_all.click()
     while True:
         jobs = window.c.store.jobs()
         assert all(job.state not in ("failed", "auth") for job in jobs), [(job.id, job.reason) for job in jobs]

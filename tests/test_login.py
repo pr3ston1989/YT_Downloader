@@ -19,6 +19,7 @@ from yt_downloader.worker import base_parameters, run_worker
 PRIVATE = "This playlist is private"
 MISSING = "The playlist does not exist."
 AGE = "This video is age-restricted and YouTube is requiring age verification."
+MEMBERS = "Sign in or join this channel to get access to members-only content like this video."
 PLAYLIST = "https://www.youtube.com/playlist?list=PLTest"
 VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 COOKIES = (b"# Netscape HTTP Cookie File\n"
@@ -32,6 +33,7 @@ class LoginWorkerTests(unittest.TestCase):
             ("playlist", PLAYLIST, PRIVATE, "auth"),
             ("playlist", PLAYLIST, MISSING, "playlist_access"),
             ("video", VIDEO, AGE, "auth"),
+            ("video", VIDEO, MEMBERS, "members"),
             ("video", VIDEO, "HTTP Error 403: Forbidden", "extractor"),
         ):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
@@ -59,6 +61,26 @@ class LoginWorkerTests(unittest.TestCase):
             data = params["cookiefile"].getvalue()
             self.assertIn("#HttpOnly_.youtube.com", data)
             self.assertNotIn("example.org", data)
+
+    def test_playlist_omits_known_members_without_renumbering_the_other_videos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            atomic_json(root / "request.json", {
+                "operation": "scan", "source": {"kind": "playlist", "url": PLAYLIST},
+                "runtime": {"engine": "", "ffmpeg": "", "deno": ""}, "cache": "",
+            })
+            with (patch("yt_downloader.worker.load_engine") as load,
+                  patch("yt_downloader.worker.tempfile.tempdir", tempfile.tempdir)):
+                load.return_value.return_value.__enter__.return_value.extract_info.return_value = {
+                    "title": "Playlista", "entries": [
+                        {"id": "jNQXAC9IVRw", "availability": "subscriber_only"},
+                        {"id": "BaW_jenozKc", "availability": "public"},
+                    ],
+                }
+                self.assertEqual(run_worker(root), 0)
+            event, done = map(json.loads, (root / "events.jsonl").read_text(encoding="utf-8").splitlines())
+            self.assertEqual((event["entry"]["id"], event["entry"]["index"]), ("BaW_jenozKc", 2))
+            self.assertEqual(done, {"kind": "done", "count": 1, "skipped_members": 1})
 
 
 class LoginUITests(unittest.TestCase):
@@ -131,6 +153,21 @@ class LoginUITests(unittest.TestCase):
         self.window.retry_after_login()
         c.finish_job(Running(None, c.store.claim(), "", result))
         self.assertEqual(c.store.jobs()[0].state, "failed")
+
+    def test_members_job_is_skipped_without_opening_a_browser_or_marking_it_downloaded(self):
+        c = self.controller
+        entry = Entry("jNQXAC9IVRw", "Dla wspierających")
+        c.store.enqueue([entry], c.prefs.options)
+        result = {"kind": "error", "code": "members", "message": MEMBERS}
+        with patch("yt_downloader.ui.QDesktopServices.openUrl") as open_url:
+            c.finish_job(Running(None, c.store.claim(), "", result))
+            self.assertEqual(c.store.jobs()[0].state, "skipped")
+            self.assertEqual(c.store.history(), [])
+            c.prefs.skip_members = False
+            c.store.enqueue([entry], c.prefs.options)
+            c.finish_job(Running(None, c.store.claim(), "", result))
+            self.assertEqual(c.store.jobs()[-1].state, "auth")
+            open_url.assert_not_called()
 
 
 if __name__ == "__main__":

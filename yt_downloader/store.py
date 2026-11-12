@@ -20,6 +20,7 @@ class Job:
     reason: str
     path: str
     package_id: int | None = None
+    error_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class Store:
         root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(root / "data.sqlite3", timeout=15)
         self.db.row_factory = sqlite3.Row
+        self.job_rows = {}
         self.db.executescript("""
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
@@ -58,6 +60,9 @@ class Store:
                 id INTEGER PRIMARY KEY, root TEXT NOT NULL, video_id TEXT NOT NULL, title TEXT NOT NULL,
                 files TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS file_move_undo (
+                id INTEGER PRIMARY KEY, video_id TEXT NOT NULL, title TEXT NOT NULL, files TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS updates (
                 time REAL NOT NULL, component TEXT NOT NULL, version TEXT NOT NULL,
                 status TEXT NOT NULL, detail TEXT NOT NULL
@@ -76,7 +81,10 @@ class Store:
             self.db.execute("ALTER TABLE jobs ADD COLUMN queue_position INTEGER")
         if "package_id" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN package_id INTEGER REFERENCES packages(id)")
+        if "error_code" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN error_code TEXT NOT NULL DEFAULT ''")
         self.db.execute("CREATE INDEX IF NOT EXISTS job_package ON jobs (package_id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS job_order ON jobs (state, COALESCE(queue_position, id))")
         columns = {column["name"] for column in self.db.execute("PRAGMA table_info(subscriptions)")}
         for name in ("needs_login", "music"):
             if name not in columns:
@@ -134,7 +142,7 @@ class Store:
         return count
 
     def enqueue_batch(self, entries, options: Options, *, only_new=False, first=False, overrides=None,
-                      package_id=None, package_name=None):
+                      package_id=None, package_name=None, omit_queued_duplicates=False):
         encoded = json.dumps(asdict(options), ensure_ascii=False)
         per_entry = {video_id: json.dumps(asdict(value), ensure_ascii=False)
                      for video_id, value in (overrides or {}).items()}
@@ -165,6 +173,13 @@ class Store:
                     WHERE NOT EXISTS (SELECT 1 FROM downloads WHERE id=?1)
                     AND NOT EXISTS (SELECT 1 FROM jobs WHERE video_id=?1 AND state NOT IN ('skipped','failed'))
                 """, rows).rowcount
+            elif omit_queued_duplicates:
+                count = self.db.executemany("""
+                    INSERT INTO jobs (video_id,entry,options,queue_position,package_id)
+                    SELECT ?1, ?2, ?3, ?4, ?5 WHERE json_extract(?3, '$.force')
+                    OR NOT EXISTS (SELECT 1 FROM jobs WHERE video_id=?1
+                                   AND state NOT IN ('done','skipped','failed'))
+                """, rows).rowcount
             else:
                 count = self.db.executemany("""
                     INSERT INTO jobs (video_id,entry,options,queue_position,package_id) VALUES (?,?,?,?,?)
@@ -181,10 +196,26 @@ class Store:
     def job(row):
         return Job(row["id"], Entry(**json.loads(row["entry"])), Options(**json.loads(row["options"])),
                    row["state"], row["attempts"], row["recovery"], row["auth_attempts"],
-                   row["reason"], row["path"], row["package_id"])
+                   row["reason"], row["path"], row["package_id"], row["error_code"])
 
     def jobs(self):
-        return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY COALESCE(queue_position, id)")]
+        previous = self.job_rows
+        self.job_rows = {}
+        jobs = []
+        for row in self.db.execute("SELECT * FROM jobs ORDER BY COALESCE(queue_position, id)"):
+            cached = previous.get(row["id"])
+            if cached is None or cached[0] != row:
+                cached = row, self.job(row)
+            self.job_rows[row["id"]] = cached
+            jobs.append(cached[1])
+        return jobs
+
+    def duplicate_ids(self, ids):
+        encoded = json.dumps(list(set(ids)))
+        queued = self.db.execute("""SELECT DISTINCT video_id FROM jobs WHERE state NOT IN ('done','failed','skipped')
+                                  AND video_id IN (SELECT value FROM json_each(?))""", (encoded,))
+        history = self.db.execute("SELECT id FROM downloads WHERE id IN (SELECT value FROM json_each(?))", (encoded,))
+        return {row[0] for row in queued}, {row[0] for row in history}
 
     def waiting_rows(self):
         placeholders = ",".join("?" for _ in WAITING_STATES)
@@ -255,35 +286,67 @@ class Store:
             order[index:index] = members
             return self.write_order(rows, order)
 
+    def reorder_relative(self, ids, package_id, target_id, target_package, after):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.waiting_rows()
+            selected = ({row["id"] for row in rows if row["package_id"] == package_id}
+                        if package_id is not None else set(ids))
+            order = [row["id"] for row in rows if row["id"] not in selected]
+            if target_package is not None:
+                anchors = {row["id"] for row in rows if row["package_id"] == target_package}
+            else:
+                anchors = {target_id}
+            edges = [i for i, job_id in enumerate(order) if job_id in anchors]
+            if not edges or not selected:
+                return 0
+            index = edges[-1] + 1 if after else edges[0]
+            order[index:index] = [row["id"] for row in rows if row["id"] in selected]
+            return self.write_order(rows, order)
+
     def skip_downloaded(self, excluded=()):
         with self.db:
             return self.db.execute("""
                 UPDATE jobs SET state='skipped', reason=? WHERE state='queued'
                     AND id NOT IN (SELECT value FROM json_each(?))
-                    AND NOT json_extract(options, '$.force')
+                    AND NOT COALESCE(json_extract(options, '$.force'), 0)
                     AND EXISTS (SELECT 1 FROM downloads WHERE id=jobs.video_id)
             """, ("Film jest już w historii.", json.dumps(list(excluded)))).rowcount
 
+    def runnable_jobs(self, limit, excluded=(), moving=()):
+        return [self.job(row) for row in self.db.execute(self.runnable_sql("j.*"),
+                                                        self.runnable_args(limit, excluded, moving))]
+
+    @staticmethod
+    def runnable_args(limit, excluded, moving):
+        return time.time(), json.dumps(list(excluded)), json.dumps(list(moving)), limit
+
+    @staticmethod
+    def runnable_sql(fields):
+        return f"""
+            SELECT {fields} FROM jobs j WHERE j.state='queued' AND j.ready<=?
+            AND j.id NOT IN (SELECT value FROM json_each(?))
+            AND j.video_id NOT IN (SELECT value FROM json_each(?))
+            AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.id=j.package_id AND p.paused)
+            AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
+            AND (json_extract(j.options, '$.force') OR NOT EXISTS (SELECT 1 FROM downloads d WHERE d.id=j.video_id))
+            ORDER BY COALESCE(j.queue_position, j.id) LIMIT ?
+        """
+
     def claim(self, excluded=(), moving=()):
         with self.db:
-            row = self.db.execute("""
-                UPDATE jobs SET state='running', reason='' WHERE id=(
-                    SELECT j.id FROM jobs j WHERE j.state='queued' AND j.ready<=?
-                    AND j.id NOT IN (SELECT value FROM json_each(?))
-                    AND j.video_id NOT IN (SELECT value FROM json_each(?))
-                    AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.id=j.package_id AND p.paused)
-                    AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
-                    ORDER BY COALESCE(j.queue_position, j.id) LIMIT 1
-                ) RETURNING *
-            """, (time.time(), json.dumps(list(excluded)), json.dumps(list(moving)))).fetchone()
+            row = self.db.execute(f"""
+                UPDATE jobs SET state='running', reason='', error_code='' WHERE id=({self.runnable_sql('j.id')})
+                RETURNING *
+            """, self.runnable_args(1, excluded, moving)).fetchone()
             return self.job(row) if row else None
 
-    def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None):
+    def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None, error_code=""):
         with self.db:
             self.db.execute("""
-                UPDATE jobs SET state=?, reason=?, ready=?, attempts=COALESCE(?, attempts),
+                UPDATE jobs SET state=?, reason=?, error_code=?, ready=?, attempts=COALESCE(?, attempts),
                     recovery=COALESCE(?, recovery) WHERE id=?
-            """, (state, reason, time.time() + delay, attempts, recovery, job_id))
+            """, (state, reason, error_code, time.time() + delay, attempts, recovery, job_id))
 
     def complete(self, job: Job, path: str):
         with self.db:
@@ -299,7 +362,7 @@ class Store:
         selection = None if ids is None else json.dumps(list(ids))
         with self.db:
             return self.db.execute("""
-                UPDATE jobs SET state='queued', reason='', attempts=0, recovery=0, auth_attempts=0, ready=0
+                UPDATE jobs SET state='queued', reason='', error_code='', attempts=0, recovery=0, auth_attempts=0, ready=0
                 WHERE state='failed'
                     AND (?1 IS NULL OR id IN (SELECT value FROM json_each(?1)))
             """, (selection,)).rowcount
@@ -319,7 +382,7 @@ class Store:
     def retry_auth(self):
         with self.db:
             self.db.execute("""
-                UPDATE jobs SET state='queued', reason='', ready=0, auth_attempts=auth_attempts+1
+                UPDATE jobs SET state='queued', reason='', error_code='', ready=0, auth_attempts=auth_attempts+1
                 WHERE state='auth'
             """)
             self.db.execute("UPDATE subscriptions SET needs_login=0, due=0 WHERE needs_login=1")
@@ -342,6 +405,15 @@ class Store:
     def history(self):
         return self.db.execute("SELECT * FROM downloads ORDER BY time DESC").fetchall()
 
+    def relink_download(self, video_id, old_path, new_path):
+        with self.db:
+            count = self.db.execute("UPDATE downloads SET path=? WHERE id=? AND path=?",
+                                    (new_path, video_id, old_path)).rowcount
+            if count and old_path:
+                self.db.execute("UPDATE jobs SET path=? WHERE video_id=? AND path=? COLLATE NOCASE",
+                                (new_path, video_id, old_path))
+            return count
+
     def record_file_move(self, root, video_id, title, files):
         with self.db:
             return self.db.execute("INSERT INTO file_moves (root,video_id,title,files) VALUES (?,?,?,?)",
@@ -354,7 +426,10 @@ class Store:
         with self.db:
             self.db.execute("UPDATE file_moves SET files=? WHERE id=?", (json.dumps(files), move_id))
 
-    def finish_file_move(self, move_id, video_id, title, paths):
+    def file_move_undo(self):
+        return self.db.execute("SELECT * FROM file_move_undo ORDER BY id").fetchall()
+
+    def finish_file_move(self, move_id, video_id, title, paths, *, undo=None, undo_id=None):
         with self.db:
             for source, target in paths:
                 self.db.execute("""
@@ -364,6 +439,17 @@ class Store:
                 """, (video_id, title, target, time.time(), source))
                 self.db.execute("UPDATE jobs SET path=? WHERE video_id=? AND path=? COLLATE NOCASE",
                                 (target, video_id, source))
+            if undo:
+                batch, files = undo
+                current = self.get("undo_move_batch", 0)
+                if batch > current:
+                    self.db.execute("DELETE FROM file_move_undo")
+                    self.db.execute("INSERT OR REPLACE INTO preferences VALUES ('undo_move_batch',?)", (str(batch),))
+                if batch >= current:
+                    self.db.execute("INSERT INTO file_move_undo (video_id,title,files) VALUES (?,?,?)",
+                                    (video_id, title, json.dumps(files)))
+            if undo_id is not None:
+                self.db.execute("DELETE FROM file_move_undo WHERE id=?", (undo_id,))
             self.db.execute("DELETE FROM file_moves WHERE id=?", (move_id,))
 
     def import_archive(self, lines):

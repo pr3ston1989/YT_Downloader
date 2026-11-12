@@ -34,8 +34,9 @@ class FixtureWorker:
         self.pending.append(event)
         self.exit_code = 0 if event["kind"] == "done" else 1
 
-    def events(self):
-        batch, self.pending = self.pending, []
+    def events(self, limit=None):
+        batch = self.pending[:limit]
+        self.pending = self.pending[len(batch):]
         return batch
 
     def poll(self):
@@ -97,6 +98,33 @@ class ControllerTests(unittest.TestCase):
         self.c.poll_jobs()
         self.assertEqual(self.c.store.jobs()[0].state, "done")
         self.assertEqual(self.c.store.history()[0]["id"], VIDEO.id)
+
+    def test_pause_after_current_finishes_active_jobs_without_starting_waiting_jobs(self):
+        worker = self.enqueue(VIDEO, NEXT_VIDEO)
+        self.c.pause_all(True, finish_current=True)
+        self.assertIsNone(worker.exit_code)
+        self.assertTrue(self.c.store.get("queue_paused"))
+        worker.finish(kind="done", path="film.mp4")
+        self.c.step()
+        self.assertEqual(self.c.active, {})
+        self.assertEqual([job.state for job in self.c.store.jobs()], ["done", "queued"])
+        self.c.pause_all(False)
+        self.c.step()
+        self.assertEqual(list(self.c.active), [2])
+
+    def test_finished_scan_keeps_all_events_when_the_log_spans_multiple_poll_batches(self):
+        self.c.preview(parse_source(CHANNEL), ["videos"])
+        worker = self.c.scan.worker
+        worker.pending.extend({"kind": "entry", "entry": asdict(VIDEO)} for _ in range(650))
+        worker.finish(kind="done", count=650)
+        results = []
+        self.c.scanned.connect(results.append)
+        self.c.poll_scan()
+        self.assertEqual(len(self.c.scan.entries), 512)
+        self.assertFalse(worker.closed)
+        self.c.poll_scan()
+        self.assertTrue(worker.closed)
+        self.assertEqual(len(results[0]["entries"]), 650)
 
     def test_removing_active_and_waiting_jobs_does_not_restart_them(self):
         current = self.enqueue(VIDEO, NEXT_VIDEO, Entry("BaW_jenozKc", "Trzeci film"))

@@ -26,6 +26,7 @@ class FileGroup:
     target: Path
     signatures: tuple[tuple[int, ...], ...]
     status: str = ""
+    undo_id: int | None = None
 
 
 def make_plan(root, entries, history):
@@ -126,6 +127,27 @@ def signature(path):
     return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
 
 
+def plan_undo(records):
+    groups = []
+    for row in records:
+        files = json.loads(row["files"])
+        target = Path(files[0][0]).parent
+        paths = tuple(Path(dst) for _, dst, _ in files)
+        signatures = tuple(tuple(expected) for _, _, expected in files)
+        status = ""
+        try:
+            if not target.is_dir() or target.resolve(strict=True) != target:
+                status = "Pierwotny folder niedostępny"
+            elif any(not has_signature(path, list(expected)) for path, expected in zip(paths, signatures)):
+                status = "Plik zmieniony lub niedostępny"
+            elif any((target / path.name).exists() or (target / path.name).is_symlink() for path in paths):
+                status = "Konflikt nazw"
+        except OSError:
+            status = "Plik lub folder niedostępny"
+        groups.append(FileGroup(row["video_id"], row["title"], paths, target, signatures, status, row["id"]))
+    return groups
+
+
 def location(source, target, expected):
     try:
         if not source.is_symlink() and signature(source) == expected:
@@ -200,7 +222,10 @@ def settle_selected(store, move, transfer):
         staged_path.unlink(missing_ok=True)
     if stage.exists():
         stage.rmdir()
-    store.finish_file_move(move["id"], move["video_id"], move["title"], moved)
+    batch = transfer.get("undo_batch") if committed else None
+    undo = (batch, [(str(src), str(dst), staged) for src, dst, _, staged in files]) if batch else None
+    store.finish_file_move(move["id"], move["video_id"], move["title"], moved, undo=undo,
+                           undo_id=transfer.get("undo_id") if committed else None)
 
 
 def stage_file(source, staged):
@@ -215,7 +240,7 @@ def stage_file(source, staged):
         shutil.copystat(source, staged)
 
 
-def move_selected_group(store, group):
+def move_selected_group(store, group, undo_batch):
     source_dir = group.files[0].parent
     stage = group.target / f".yt-downloader-move-{uuid4().hex}"
     files = [[str(src), str(group.target / src.name), list(expected), None]
@@ -225,7 +250,8 @@ def move_selected_group(store, group):
         if (not safe_parent(src, source_dir) or not safe_parent(dst, group.target) or
                 not has_signature(src, expected) or dst.exists() or dst.is_symlink()):
             raise OSError("The source or destination changed since the preview")
-    transfer = {"phase": "stage", "stage": str(stage), "files": files}
+    transfer = {"phase": "stage", "stage": str(stage), "files": files,
+                "undo_batch": undo_batch if group.undo_id is None else None, "undo_id": group.undo_id}
     move_id = store.record_file_move(source_dir, group.video_id, group.title, transfer)
     move = {"id": move_id, "root": str(source_dir), "video_id": group.video_id, "title": group.title}
     stage.mkdir()
@@ -258,7 +284,7 @@ def recover_file_moves(store):
             LOG.exception("Sprawdzanie przerwanego przenoszenia plików")
 
 
-def apply_plan(store, root, groups, active_ids):
+def apply_plan(store, root, groups, active_ids, *, undo_batch=None):
     moved, errors, busy = 0, 0, 0
     for group in groups:
         if group.status:
@@ -268,7 +294,7 @@ def apply_plan(store, root, groups, active_ids):
             continue
         try:
             if root is None:
-                move_selected_group(store, group)
+                move_selected_group(store, group, undo_batch)
                 moved += len(group.files)
                 continue
             files = [(path, group.target / path.name) for path in group.files]

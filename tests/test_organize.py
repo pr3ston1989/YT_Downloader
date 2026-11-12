@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from yt_downloader.model import Entry, Options
-from yt_downloader.organize import apply_plan, make_plan, plan_selected, recover_file_moves, rename_file, signature
+from yt_downloader.organize import apply_plan, make_plan, plan_selected, plan_undo, recover_file_moves, rename_file, signature
 from yt_downloader.store import Store
 
 
@@ -165,3 +165,27 @@ class OrganizeTests(unittest.TestCase):
         with self.assertLogs("yt_downloader.organize", level="ERROR"):
             self.assertEqual(apply_plan(self.store, None, planned, set()), (0, 1, 0))
         self.assertEqual(original.read_bytes(), b"source replaced after preview")
+
+    def test_undo_reopens_original_paths_and_restores_companions_without_overwriting_conflicts(self):
+        original = self.file("Autor/Film.mkv", b"media")
+        subtitle = self.file("Autor/Film.pl.srt", b"captions")
+        target = self.root.parent / "Cel"
+        target.mkdir()
+        self.store.enqueue([VIDEO], Options(folder=str(self.root)))
+        self.store.complete(self.store.claim(), str(original))
+        groups = plan_selected([(VIDEO.id, VIDEO.title, str(original))], target)
+        self.assertEqual(apply_plan(self.store, None, groups, set(), undo_batch=1), (2, 0, 0))
+        original.write_bytes(b"keep")
+        with closing(Store(self.root.parent / "data")) as reopened:
+            groups = plan_undo(reopened.file_move_undo())
+            self.assertEqual(groups[0].status, "Konflikt nazw")
+            self.assertEqual(apply_plan(reopened, None, groups, set()), (0, 0, 0))
+            self.assertEqual(original.read_bytes(), b"keep")
+            original.unlink()
+            groups = plan_undo(reopened.file_move_undo())
+            self.assertEqual(apply_plan(reopened, None, groups, set()), (2, 0, 0))
+            self.assertEqual(reopened.file_move_undo(), [])
+            self.assertEqual(reopened.history()[0]["path"], str(original))
+            self.assertEqual(reopened.jobs()[0].path, str(original))
+        self.assertEqual(original.read_bytes(), b"media")
+        self.assertEqual(subtitle.read_bytes(), b"captions")

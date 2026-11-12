@@ -17,13 +17,17 @@ Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę o
 
 Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kolejki do widocznych wierszy. Po wyczyszczeniu filtra zobaczysz ponownie całą listę.
 
+W karcie **Zbieracz linków** możesz wkleić kilka adresów naraz. Każde źródło ma własny wynik odczytu, liczbę powtórzeń i opcje profilu oraz folderu. **Otwórz podgląd** pozwala przejrzeć i wybrać filmy z odczytanego źródła. Podgląd oznacza wpisy z kolejki i historii. Pozycje już oczekujące są domyślnie pomijane podczas ponownego dodawania. Aby pobrać ten sam materiał ponownie, np. w innym formacie, włącz **Pozwalaj na ponowne pobranie** w parametrach.
+
+Opcja **Pomijaj filmy tylko dla wspierających** jest domyślnie włączona. Aplikacja pomija je podczas odczytu listy, jeśli YouTube poda ich status, lub w kolejce, gdy dostęp zostanie sprawdzony dopiero podczas pobierania. Wyłączenie opcji pozwala próbować pobrać materiał z konta, które ma dostęp. Dla materiałów wymagających członkostwa przeglądarkę otwierasz ręcznie.
+
 **Podgląd** i **Kolejka** mają osobne karty. W podglądzie przycisk **Parametry pobierania…** pozwala wybrać m.in. format, jakość, język audio, napisy i folder dla dodawanych pozycji. Możesz dodać część listy z jednymi parametrami, a następnie zmienić je i dodać pozostałe. Użyj **Profile… → Zapisz parametry podglądu…**, aby zachować ustawienia pod własną nazwą. Nowy podgląd przywraca ustawienia aktywnego profilu lub ustawienia domyślne.
 
 W podglądzie możesz zachować kolejność źródła, odwrócić listę albo posortować ją według dat publikacji. Daty z podglądu mogą być przybliżone. Pozycje bez dat trafiają na koniec. Jeśli playlista zaczyna się od najnowszych i nie zawiera dat, wybierz **Odwróć listę**. Po zmianie kolejności pole `{index}` używa numerów z całej posortowanej listy, także gdy dodajesz tylko zaznaczone pozycje.
 
 Przy spójnej numeracji w tytułach podgląd automatycznie wybiera **Według numeru odcinka**. Rozpoznaje m.in. `Odc. 23`, `#23`, `S02E07` i oznaczenia typu `| 23.`. Jednoznaczne oznaczenia są rozpoznawane także dla pojedynczego filmu. Pole `{index}` zachowuje numer odcinka i jego ewentualny sezon. Pozycje bez rozpoznanego numeru trafiają na koniec. Kolejność można zmienić przed dodaniem pozycji do kolejki.
 
-W karcie **Historia pobrań** kliknij **Importuj archiwum yt-dlp…**, aby wczytać plik tekstowy z wierszami `youtube ID_FILMU`. Znane identyfikatory są pomijane przy dodawaniu materiałów do kolejki i przez subskrypcje. Aby pobrać materiał ponownie, zaznacz **Pobieraj ponownie filmy z historii** w parametrach podglądu.
+W karcie **Historia pobrań** kliknij **Importuj archiwum yt-dlp…**, aby wczytać plik tekstowy z wierszami `youtube ID_FILMU`. Znane identyfikatory są pomijane przy dodawaniu materiałów do kolejki i przez subskrypcje. Aby pobrać materiał ponownie, zaznacz **Pozwalaj na ponowne pobranie** w parametrach podglądu.
 
 ## YouTube Music
 
@@ -33,7 +37,11 @@ Dla YouTube Music podgląd domyślnie wybiera **Tylko audio**. Zmień tryb przy 
 
 Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadania w toku wracają do kolejki, a wstrzymane pozostają wstrzymane. Wznawianie korzysta z plików `.part` i zależy od obsługi wznawiania przez serwer oraz dostępności tego samego strumienia. Gdy silnik wybierze inny strumień, aplikacja rozpoczyna pobieranie od początku. Błędy sieci mają trzy ponowienia z rosnącym opóźnieniem. W zakładce **Historia pobrań** możesz przejrzeć albo wyczyścić pamięć ID.
 
+**Wstrzymaj po bieżących** pozwala dokończyć wszystkie aktywne pobrania i obróbkę plików. Pozostałe zadania czekają na **Wznów kolejkę**, również po ponownym uruchomieniu aplikacji. Przed startem aplikacja sprawdza wolne miejsce w folderze docelowym. Dla nowych pobrań uwzględnia rozmiar strumieni, jeśli serwis go podał, i zostawia co najmniej 16 MiB zapasu. Po błędzie zapisu wybierz z menu zadania **Zmień folder i ponów…**.
+
 W karcie **Kolejka** możesz przenieść zaznaczone oczekujące zadania **Na początek**, **Wyżej**, **Niżej** albo **Na koniec**. Przycisk **Pobierz następne** w podglądzie dodaje zaznaczone widoczne pozycje od razu na początek kolejki. Zadania ruszą, gdy zwolni się miejsce na pobranie. Jeśli kolejka jest wstrzymana, wznów ją. Aplikacja zachowuje kolejność po ponownym uruchomieniu.
+
+Możesz też przeciągać oczekujące zadania i nagłówki pakietów. Linia pod kursorem wskazuje miejsce upuszczenia. **Następne do pobrania** pokazuje pierwsze zadanie gotowe do startu.
 
 Podgląd playlisty, kanału lub albumu domyślnie tworzy osobny pakiet w kolejce. W menu **Pakiet** możesz wskazać istniejący pakiet, wpisać własną nazwę lub dodać pozycje luzem. Kliknij nagłówek pakietu dwukrotnie, aby go zwinąć lub rozwinąć. Nagłówek pokazuje postęp i liczbę błędów. Z jego menu możesz wstrzymać cały pakiet, zmienić kolejność jego oczekujących zadań, ustawić im folder albo zastosować zapisany profil. Pauza i zwinięcie pakietu są zapisywane po zamknięciu aplikacji.
 
@@ -42,6 +50,8 @@ Kolejkę można filtrować jednocześnie po fragmencie tytułu i stanie zadania.
 **Usuń z kolejki** usuwa zaznaczone zadania z listy i zatrzymuje aktywne pobrania. Pliki i historia pobrań zostają na dysku. **Parametry…** zmienia ustawienia wybranych zadań przed ich uruchomieniem lub ponowieniem. Przy wielu zadaniach zapis obejmuje pola zmienione w oknie. **Ponów wybrane** ponawia tylko zaznaczone nieudane zadania.
 
 Kliknij gotowe pobranie prawym przyciskiem w kolejce lub historii, aby wybrać **Pokaż w Eksploratorze** lub **Przenieś do folderu…**. Zaznacz kilka pozycji, aby przenieść je razem. Przed zatwierdzeniem zobaczysz pliki towarzyszące i konflikty nazw. Po przeniesieniu aplikacja aktualizuje ścieżki w kolejce i historii.
+
+Historia sprawdza dostępność plików w tle. Dla brakującego pliku możesz użyć **Wskaż położenie pliku…** lub **Pobierz ponownie**. Menu **Więcej…** w historii pozwala cofnąć ostatnie przeniesienie wykonane z kolejki lub historii. Cofanie pokazuje plan i omija konflikty.
 
 W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja odczyta dostępne rozdzielczości, kodeki i języki audio oraz rozróżni napisy ręczne i automatyczne. Wybierz limit rozdzielczości, język audio lub napisy i kliknij **Zastosuj do tego filmu**. Indywidualne wybory są zapisywane w zadaniu przy dodawaniu do kolejki i mają pierwszeństwo przed parametrami podglądu. Wybrany tu język audio jest wymagany. Opcja **Z parametrów podglądu** pozwala ponownie korzystać z ustawień wspólnych dla danej grupy.
 

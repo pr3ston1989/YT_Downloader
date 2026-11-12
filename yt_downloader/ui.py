@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+from concurrent.futures import Future
 from dataclasses import asdict, replace
 from datetime import datetime
 import json
@@ -7,31 +8,34 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
+from threading import Thread
 import winreg
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QItemSelection, QItemSelectionModel, QLockFile, QModelIndex, QSortFilterProxyModel,
-    Qt, QTimer, QUrl,
+    QAbstractTableModel, QItemSelection, QItemSelectionModel, QLockFile, QMimeData, QModelIndex, QSortFilterProxyModel,
+    Qt, QTimer, QUrl, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+    QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
     QStyle, QStyleOptionProgressBar, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
     QTableView, QVBoxLayout, QWidget,
 )
 
 from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
+from .collector import LinkCollector
 from .controller import Controller, LABELS
 from .model import (
-    APP_DIR, CHANNEL_TABS, EDITABLE_STATES, LANGUAGE_CODE, Options, TERMINAL, WAITING_STATES,
+    APP_DIR, CHANNEL_TABS, EDITABLE_STATES, LANGUAGE_CODE, Entry, Options, TERMINAL, WAITING_STATES,
     detect_episode_numbers, parse_source,
 )
 from .runtime import RESOURCES, atomic_bytes, command
-from .organize import apply_plan, make_plan, plan_selected
+from .organize import apply_plan, make_plan, plan_selected, plan_undo
 from .updates.application import restart_for
 from .store import Job, Package
 
@@ -91,6 +95,18 @@ def duration(seconds):
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
+def history_file_status(paths):
+    results = {}
+    for value in paths:
+        try:
+            results[value] = "" if stat.S_ISREG(Path(value).stat().st_mode) else "Brak pliku"
+        except FileNotFoundError:
+            results[value] = "Brak pliku"
+        except (OSError, ValueError):
+            results[value] = "Niedostępny"
+    return results
+
+
 class TableModel(QAbstractTableModel):
     def __init__(self, headers):
         super().__init__()
@@ -121,13 +137,14 @@ class TableModel(QAbstractTableModel):
 
 class PreviewModel(TableModel):
     def __init__(self):
-        super().__init__(("Pobierz", "Nr", "Tytuł", "Kanał", "Czas", "Zakładka"))
+        super().__init__(("Pobierz", "Nr", "Tytuł", "Kanał", "Czas", "Zakładka", "Stan"))
         self.selected = set()
         self.entries = []
         self.positions = {}
         self.number_labels = {}
         self.episode_numbers = {}
         self.checkable = True
+        self.duplicates = {}
 
     def set_entries(self, entries):
         self.beginResetModel()
@@ -148,9 +165,17 @@ class PreviewModel(TableModel):
         self.beginInsertRows(QModelIndex(), first, end - 1)
         self.entries.extend(entries)
         self.selected.update(range(first, end))
-        self.rows.extend(("", str(e.index), e.title, e.channel, duration(e.duration), TAB_NAMES.get(e.tab, ""))
+        self.rows.extend(("", str(e.index), e.title, e.channel, duration(e.duration), TAB_NAMES.get(e.tab, ""), "")
                          for e in entries)
         self.endInsertRows()
+
+    def set_duplicates(self, queued, history):
+        counts = Counter(entry.id for entry in self.entries)
+        self.duplicates = {video_id: ("Już w kolejce" if video_id in queued else "W historii" if video_id in history
+                                      else "Powtórzenie na liście") for video_id, count in counts.items()
+                           if video_id in queued or video_id in history or count > 1}
+        if self.rows:
+            self.dataChanged.emit(self.index(0, 6), self.index(len(self.rows) - 1, 6), [DISPLAY])
 
     def set_checkable(self, checkable):
         self.checkable = checkable
@@ -200,6 +225,8 @@ class PreviewModel(TableModel):
         return flags | Qt.ItemFlag.ItemIsUserCheckable if self.checkable and index.column() == 0 else flags
 
     def data(self, index, role=DISPLAY):
+        if index.isValid() and index.column() == 6 and role in (DISPLAY, Qt.ItemDataRole.ToolTipRole):
+            return self.duplicates.get(self.entries[index.row()].id, "")
         if index.isValid() and index.column() == 0 and role == CHECK:
             return Qt.CheckState.Checked if index.row() in self.selected else Qt.CheckState.Unchecked
         if index.isValid() and index.column() == 1 and index.row() in self.positions:
@@ -235,7 +262,10 @@ class QueueModel(TableModel):
         self.jobs = []
         self.by_id = {}
         self.positions = {}
+        self.waiting_positions = {}
         self.events = {}
+        self.packages = {}
+        self.last_collapsed = set()
         self.items = []
         self.collapsed = set()
         self.package_jobs = defaultdict(list)
@@ -246,8 +276,14 @@ class QueueModel(TableModel):
 
     def update_jobs(self, jobs, packages=None):
         packages = packages or {}
+        if self.jobs == jobs and self.packages == packages and self.last_collapsed == self.collapsed:
+            return False
+        self.packages = packages
+        self.last_collapsed = self.collapsed.copy()
+        old_jobs, old_positions, old_rows = self.by_id, self.positions, self.rows
         self.jobs = jobs
         self.by_id = {job.id: job for job in jobs}
+        self.waiting_positions = {job.id: i for i, job in enumerate(job for job in jobs if job.state in WAITING_STATES)}
         self.events = {job.id: self.events[job.id] for job in jobs
                        if job.state == "running" and job.id in self.events}
         self.positions = {}
@@ -291,11 +327,22 @@ class QueueModel(TableModel):
         same_ids = len(items) == len(self.items) and all(type(a) is type(b) and a.id == b.id
                                                         for a, b in zip(items, self.items))
         self.items = items
-        rows = [self.package_cells(item) if isinstance(item, Package) else self.cells(item) for item in items]
+        rows = []
+        for item in items:
+            if isinstance(item, Package):
+                rows.append(self.package_cells(item))
+            elif item is old_jobs.get(item.id) and item.id in old_positions:
+                rows.append(old_rows[old_positions[item.id]])
+            else:
+                rows.append(self.cells(item))
         if same_ids:
+            changed = [i for i, (old, new) in enumerate(zip(self.rows, rows)) if old != new]
             self.rows = rows
-            if rows:
-                self.dataChanged.emit(self.index(0, 0), self.index(len(rows) - 1, 5))
+            if len(changed) > 12:
+                self.dataChanged.emit(self.index(changed[0], 0), self.index(changed[-1], 5))
+            else:
+                for position in changed:
+                    self.dataChanged.emit(self.index(position, 0), self.index(position, 5))
         else:
             self.replace(rows)
         return not same_ids
@@ -342,11 +389,23 @@ class QueueModel(TableModel):
         if index.isValid():
             if index.column() == 2 and role == USER:
                 return self.rows[index.row()][2]
+            if index.column() == 0 and role == Qt.ItemDataRole.ToolTipRole:
+                title, state, _, speed, eta, details = self.rows[index.row()]
+                transfer = f"\n{speed} · ETA {eta}" if speed and speed != "—" else ""
+                return f"{title.strip()}\n{state}{transfer}" + (f"\n{details}" if details else "")
             if role == Qt.ItemDataRole.FontRole and isinstance(self.items[index.row()], Package):
                 font = QFont()
                 font.setBold(True)
                 return font
         return super().data(index, role)
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if index.isValid():
+            item = self.items[index.row()]
+            if isinstance(item, Package) or item.state in WAITING_STATES:
+                flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
 
 
 class QueueFilter(QSortFilterProxyModel):
@@ -390,8 +449,111 @@ class ProgressDelegate(QStyledItemDelegate):
         QApplication.style().drawControl(QStyle.ControlElement.CE_ProgressBar, bar, painter)
 
 
-def table(model, stretch):
-    view = QTableView()
+class QueueTable(QTableView):
+    reordered = Signal(object, object, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.dragged = []
+        self.drag_point = None
+        self.drag_timer = QTimer(self)
+        self.drag_timer.setInterval(100)
+        self.drag_timer.timeout.connect(self.scroll_during_drag)
+        self.drop_line = QFrame(self.viewport())
+        self.drop_line.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.drop_line.setStyleSheet("background-color: palette(highlight)")
+        self.drop_line.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.model() is None:
+            return
+        compact = self.viewport().width() < 820
+        self.setColumnHidden(3, compact)
+        self.setColumnHidden(4, compact)
+        self.setColumnWidth(5, 164 if compact else 230)
+
+    def item_at(self, index):
+        source = self.model().mapToSource(index)
+        return self.model().sourceModel().items[source.row()] if source.isValid() else None
+
+    def startDrag(self, supported_actions):
+        items = [self.item_at(index) for index in self.selectionModel().selectedRows()]
+        if len(items) == 1 and isinstance(items[0], Package):
+            self.dragged = items
+        elif items and all(isinstance(item, Job) and item.state in WAITING_STATES for item in items):
+            self.dragged = items
+        else:
+            return
+        mime = QMimeData()
+        mime.setData("application/x-ytdownloader-queue", b"queue")
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+        self.dragged = []
+        self.clear_drop_marker()
+
+    def dragEnterEvent(self, event):
+        if event.source() is self and self.dragged:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        point = event.position().toPoint()
+        index = self.indexAt(point)
+        if event.source() is self and self.dragged and index.isValid():
+            self.drag_point = point
+            if not self.drag_timer.isActive():
+                self.drag_timer.start()
+            self.show_drop_marker(index, point)
+            event.acceptProposedAction()
+        else:
+            self.clear_drop_marker()
+            event.ignore()
+
+    def show_drop_marker(self, index, point):
+        rect = self.visualRect(index)
+        edge = rect.bottom() if point.y() >= rect.center().y() else rect.top()
+        self.drop_line.setGeometry(0, edge, self.viewport().width(), 2)
+        self.drop_line.show()
+        self.drop_line.raise_()
+
+    def clear_drop_marker(self):
+        self.drag_timer.stop()
+        self.drag_point = None
+        self.drop_line.hide()
+
+    def scroll_during_drag(self):
+        point = self.drag_point
+        direction = -1 if point.y() < 22 else 1 if point.y() > self.viewport().height() - 22 else 0
+        if direction:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() + direction * bar.singleStep())
+            index = self.indexAt(point)
+            if index.isValid():
+                self.show_drop_marker(index, point)
+
+    def dragLeaveEvent(self, event):
+        self.clear_drop_marker()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self.clear_drop_marker()
+        point = event.position().toPoint()
+        index = self.indexAt(point)
+        if event.source() is not self or not self.dragged or not index.isValid():
+            event.ignore()
+            return
+        self.reordered.emit(self.dragged, self.item_at(index), point.y() >= self.visualRect(index).center().y())
+        event.acceptProposedAction()
+
+
+def table(model, stretch, view_type=QTableView):
+    view = view_type()
     view.setModel(model)
     view.setAlternatingRowColors(True)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -435,7 +597,7 @@ def set_theme(app, theme):
         QHeaderView::section {{ background: {alternate}; color: {fg}; padding: 6px; border: 0; }}
         QGroupBox {{ margin-top: 12px; padding: 12px 8px 4px 8px; font-weight: 600; }}
         QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
-        QTabBar::tab {{ padding: 8px 15px; margin-right: 3px; }}
+        QTabBar::tab {{ padding: 8px 11px; margin-right: 3px; }}
         QTabBar::tab:selected {{ background: {panel}; border-bottom: 2px solid #3985d7; }}
     """)
 
@@ -467,7 +629,8 @@ class DownloadOptionsForm(QGroupBox):
         self.metadata = checkbox("Osadzaj metadane", options.metadata)
         self.thumbnail = checkbox("Osadzaj miniaturę", options.thumbnail)
         self.keep_sidecars = checkbox("Zachowuj osobne pliki z miniaturą i metadanymi", options.keep_sidecars)
-        self.force = checkbox("Pobieraj ponownie filmy z historii", options.force)
+        self.force = checkbox("Pozwalaj na ponowne pobranie", options.force)
+        self.force.setToolTip("Pozwól dodać ten sam film ponownie, nawet jeśli jest w kolejce lub historii.")
         folder_row = row(self.folder, button("Przeglądaj…", self.choose_folder))
         folder_row.layout().setStretch(0, 1)
         form.addRow("Folder docelowy", folder_row)
@@ -694,6 +857,7 @@ class Window(QMainWindow):
         self.setMinimumSize(740, 460)
         self.tabs = QTabWidget()
         self.notice = QLabel("Przygotowywanie zależności…")
+        self.notice.setTextFormat(Qt.TextFormat.PlainText)
         self.notice.setObjectName("muted")
         self.notice.setWordWrap(True)
         self.login = button("Zaloguj w przeglądarce", self.open_login)
@@ -711,14 +875,18 @@ class Window(QMainWindow):
         layout.setSpacing(11)
         layout.addWidget(row(brand, None, self.engine_label))
         layout.addWidget(self.tabs, 1)
-        layout.addWidget(row(self.notice, None, self.login, self.retry_login))
+        status_row = row(self.notice, self.login, self.retry_login)
+        status_row.layout().setStretch(0, 1)
+        layout.addWidget(status_row)
         self.preview_tab = self.preview_page()
+        self.collector_tab = LinkCollector(self)
         self.queue_tab = self.queue_page()
         self.settings_tab = self.settings_page()
         self.history_tab = self.history_page()
         self.updates_tab = self.updates_page()
         self.subscriptions_tab = self.subscriptions_page()
         self.tabs.addTab(self.preview_tab, "Podgląd")
+        self.tabs.addTab(self.collector_tab, "Zbieracz linków")
         self.tabs.addTab(self.queue_tab, "Kolejka")
         self.tabs.addTab(self.settings_tab, "Ustawienia")
         self.tabs.addTab(self.history_tab, "Historia pobrań")
@@ -777,6 +945,7 @@ class Window(QMainWindow):
         self.preview_table.setColumnWidth(0, 72)
         self.preview_table.setColumnWidth(1, 44)
         self.preview_table.setColumnWidth(4, 64)
+        self.preview_table.setColumnWidth(6, 122)
         self.preview_info = QLabel("Wklej link, aby odczytać listę.")
         self.preview_info.setWordWrap(True)
         self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
@@ -826,53 +995,83 @@ class Window(QMainWindow):
         self.queue_model = QueueModel()
         self.queue_model.collapsed = set(self.c.store.get("collapsed_packages", []))
         self.queue_filter = QueueFilter(self.queue_model, self)
-        self.queue_table = table(self.queue_filter, 0)
+        self.queue_table = table(self.queue_filter, 0, QueueTable)
+        self.queue_table.reordered.connect(self.reorder_queue_drop)
         self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.queue_table.setColumnWidth(1, 139)
-        self.queue_table.setColumnWidth(2, 116)
+        self.queue_table.setColumnWidth(1, 122)
+        self.queue_table.setColumnWidth(2, 98)
         self.queue_table.setColumnWidth(3, 92)
         self.queue_table.setColumnWidth(4, 65)
         self.queue_table.setColumnWidth(5, 230)
+        self.queue_table.verticalHeader().setDefaultSectionSize(28)
+        self.queue_table.horizontalHeader().setFixedHeight(28)
         self.queue_table.setItemDelegateForColumn(2, ProgressDelegate(self.queue_table))
         self.queue_table.doubleClicked.connect(self.toggle_package_at)
         self.queue_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.queue_table.customContextMenuRequested.connect(self.queue_menu)
-        self.pause_all = button("Wstrzymaj kolejkę", lambda: self.c.pause_all(not self.c.paused))
-        self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
-        self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
-        self.retry_failed = button("Ponów wszystkie nieudane", self.retry_failures)
-        self.move_first = button("Na początek", lambda: self.move_queue("first"))
-        self.move_up = button("Wyżej", lambda: self.move_queue("up"))
-        self.move_down = button("Niżej", lambda: self.move_queue("down"))
-        self.move_last = button("Na koniec", lambda: self.move_queue("last"))
+        icons = QStyle.StandardPixmap
+        self.pause_all = self.queue_icon("Wstrzymaj kolejkę", icons.SP_MediaPause,
+                                        lambda: self.c.pause_all(not self.c.paused))
+        self.finish_current = button("Wstrzymaj po bieżących", lambda: self.c.pause_all(True, finish_current=True))
+        self.finish_current.setToolTip("Dokończ rozpoczęte pobrania i poczekaj na ręczne wznowienie kolejki.")
+        self.pause_selected = self.queue_icon("Wstrzymaj zaznaczone", icons.SP_MediaPause,
+                                              lambda: self.selected_action("pause"))
+        self.resume_selected = self.queue_icon("Wznów zaznaczone", icons.SP_MediaPlay,
+                                               lambda: self.selected_action("resume"))
+        self.move_first = self.queue_icon("Na początek", icons.SP_MediaSkipBackward, lambda: self.move_queue("first"))
+        self.move_up = self.queue_icon("Wyżej", icons.SP_ArrowUp, lambda: self.move_queue("up"))
+        self.move_down = self.queue_icon("Niżej", icons.SP_ArrowDown, lambda: self.move_queue("down"))
+        self.move_last = self.queue_icon("Na koniec", icons.SP_MediaSkipForward, lambda: self.move_queue("last"))
         self.remove_selected = button("Usuń z kolejki", self.remove_selected_jobs)
         self.remove_selected.setToolTip("Usuń zaznaczone zadania. Aktywne pobrania zostaną zatrzymane, a pliki pozostaną na dysku.")
         self.edit_selected = button("Parametry…", self.edit_selected_jobs)
         self.retry_selected = button("Ponów wybrane", self.retry_selected_jobs)
-        for control in (self.move_first, self.move_up, self.move_down, self.move_last):
-            control.setToolTip("Zmień pozycję zaznaczonych zadań w całej kolejce.")
         self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
         self.queue_search = QLineEdit()
         self.queue_search.setPlaceholderText("Szukaj po tytule w kolejce")
         self.queue_search.setClearButtonEnabled(True)
         self.queue_status = combo([("Wszystkie stany", None), *((label, state) for state, label in LABELS.items())], None)
-        search_row = row(self.queue_search, self.queue_status)
-        search_row.layout().setStretch(0, 1)
-        queue_layout.addWidget(search_row)
-        queue_layout.addWidget(row(self.pause_selected, self.resume_selected,
-                                   self.pause_all, self.retry_failed,
-                                   button("Wyczyść zakończone", self.clear_queue), None))
-        queue_layout.addWidget(row(self.move_first, self.move_up, self.move_down, self.move_last, None,
-                                   self.edit_selected, self.retry_selected, self.remove_selected))
+        more = QPushButton("Więcej…")
+        menu = QMenu(more)
+        self.retry_failed = menu.addAction("Ponów wszystkie nieudane", self.retry_failures)
+        menu.addAction("Wyczyść zakończone", self.clear_queue)
+        more.setMenu(menu)
+        command_row = row(self.pause_all, self.finish_current, self.queue_search, self.queue_status, more)
+        command_row.layout().setStretch(2, 1)
+        queue_layout.addWidget(command_row)
+        self.next_download = QLabel()
+        self.next_download.setObjectName("muted")
+        self.next_download.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.next_download.setTextFormat(Qt.TextFormat.PlainText)
+        queue_layout.addWidget(self.next_download)
+        queue_layout.addWidget(row(self.pause_selected, self.resume_selected, self.move_first, self.move_up,
+                                   self.move_down, self.move_last, None, self.edit_selected,
+                                   self.retry_selected, self.remove_selected))
         queue_layout.addWidget(self.queue_table, 1)
         self.summary = QLabel()
+        self.summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.total = QProgressBar()
-        self.total.setFormat("%p% · łączny postęp")
-        queue_layout.addWidget(self.summary)
-        queue_layout.addWidget(self.total)
+        self.total.setFormat("%p%")
+        self.total.setFixedWidth(104)
+        self.total.setAccessibleName("Łączny postęp kolejki")
+        self.total.setToolTip("Łączny postęp kolejki")
+        progress_row = row(self.summary, self.total)
+        progress_row.layout().setStretch(0, 1)
+        queue_layout.addWidget(progress_row)
         self.queue_search.textChanged.connect(self.filter_queue)
         self.queue_status.currentIndexChanged.connect(self.filter_queue)
+        next_timer = QTimer(page)
+        next_timer.setInterval(1500)
+        next_timer.timeout.connect(lambda: self.update_next_download() if page.isVisible() else None)
+        next_timer.start()
         return page
+
+    def queue_icon(self, name, icon, action):
+        control = button("", action)
+        control.setIcon(self.style().standardIcon(icon))
+        control.setAccessibleName(name)
+        control.setToolTip(name)
+        return control
 
     def settings_page(self):
         settings = self.c.prefs
@@ -892,6 +1091,7 @@ class Window(QMainWindow):
         self.update_channel = combo([("Stable", "stable"), ("Nightly", "nightly")], settings.channel)
         self.run_at_login = checkbox("Uruchamiaj z Windows", settings.autostart)
         self.use_tray = checkbox("Pracuj w zasobniku po zamknięciu okna", settings.tray)
+        self.skip_members = checkbox("Pomijaj filmy tylko dla wspierających", settings.skip_members)
         self.browser = combo([("Plik zaimportowany lub bez logowania", ""),
                               ("Firefox", "firefox"), ("Edge", "edge"), ("Chrome", "chrome"),
                               ("Brave", "brave"), ("Opera", "opera"), ("Vivaldi", "vivaldi")], settings.browser)
@@ -900,6 +1100,7 @@ class Window(QMainWindow):
         form.addRow("Limit równoległych pobrań / motyw", row(self.parallel, self.theme, None))
         form.addRow("Aktualizacje i kanał yt-dlp", row(self.auto_update, self.update_channel, None))
         form.addRow(row(self.run_at_login, self.use_tray, None))
+        form.addRow(row(self.skip_members, None))
         form.addRow("Źródło ciasteczek", self.browser)
         form.addRow("Profil przeglądarki", self.browser_profile)
         form.addRow(row(button("Importuj ciasteczka Netscape…", self.import_cookies),
@@ -914,9 +1115,12 @@ class Window(QMainWindow):
     def history_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        self.history = TableModel(("Tytuł / źródło", "ID YouTube", "Data zapisu", "Plik"))
+        self.history = TableModel(("Tytuł / źródło", "ID YouTube", "Data zapisu", "Plik", "Stan"))
+        self.history_status = {}
+        self.history_check = None
         view = self.history_table = table(self.history, 0)
-        view.setColumnWidth(3, 420)
+        view.setColumnWidth(3, 310)
+        view.setColumnWidth(4, 120)
         view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         view.doubleClicked.connect(self.open_history_folder)
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -925,9 +1129,19 @@ class Window(QMainWindow):
         self.show_history_file.setEnabled(False)
         view.selectionModel().selectionChanged.connect(lambda *_: self.show_history_file.setEnabled(
             len(self.history_selection()) == 1))
-        layout.addWidget(row(button("Importuj archiwum yt-dlp…", self.import_history), None,
-                             self.show_history_file, button("Wyczyść historię", self.clear_history)))
+        more = QPushButton("Więcej…")
+        menu = QMenu(more)
+        menu.addAction("Importuj archiwum yt-dlp…", self.import_history)
+        undo = menu.addAction("Cofnij ostatnie przeniesienie…", self.undo_last_move)
+        menu.aboutToShow.connect(lambda: undo.setEnabled(self.c.file_move is None and bool(self.c.store.file_move_undo())))
+        menu.addAction("Wyczyść historię", self.clear_history)
+        more.setMenu(menu)
+        layout.addWidget(row(self.show_history_file, None, more))
         layout.addWidget(view)
+        self.history_timer = QTimer(page)
+        self.history_timer.setInterval(500)
+        self.history_timer.timeout.connect(self.poll_history_files)
+        self.history_timer.start()
         return page
 
     def updates_page(self):
@@ -1024,6 +1238,28 @@ class Window(QMainWindow):
         self.preview_order.setEnabled(enabled and (multiple or bool(self.preview_model.episode_numbers)))
         self.refresh_preview_actions()
 
+    def open_collected_preview(self, source, result, options):
+        if self.c.scan and not (self.c.scan.collector or self.c.scan.subscription):
+            self.notify("Poczekaj na zakończenie odczytu bieżącego podglądu.")
+            return
+        self.source.setText(source.url)
+        self.preview_source = source
+        self.preview_music = source.music
+        self.auto_package = None
+        self.choose_preview_package("auto")
+        self.media_choices.clear()
+        self.preview_search.clear()
+        self.preview_order.setCurrentIndex(0)
+        self.preview_model.set_entries([])
+        self.preview_options = options
+        self.preview_parameters.setText("Parametry pobierania…")
+        self.preview_mode.setCurrentIndex(self.preview_mode.findData(options.audio_only))
+        self.preview_mode.setEnabled(True)
+        self.preview_parameters.setEnabled(True)
+        self.on_scan(result)
+        self.refresh_login_actions()
+        self.tabs.setCurrentWidget(self.preview_tab)
+
     def order_preview(self):
         order = self.preview_order.currentData()
         self.preview_model.set_order(order)
@@ -1057,7 +1293,10 @@ class Window(QMainWindow):
         enabled = self.preview_model.checkable and self.preview_filter.rowCount() > 0
         self.select_all_button.setEnabled(enabled)
         self.select_none_button.setEnabled(enabled)
-        can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
+        selected = self.preview_model.selected
+        can_add = enabled and bool(selected) and (not self.preview_search.text().strip() or any(
+            self.preview_filter.mapToSource(self.preview_filter.index(row, 0)).row() in selected
+            for row in range(self.preview_filter.rowCount())))
         self.add_button.setEnabled(can_add)
         self.add_first.setEnabled(can_add)
         self.package_button.setEnabled(enabled)
@@ -1118,6 +1357,11 @@ class Window(QMainWindow):
                 self.refresh()
         dialog.deleteLater()
 
+    def undo_last_move(self):
+        groups = plan_undo(self.c.store.file_move_undo())
+        if groups:
+            self.confirm_file_move(None, groups)
+
     def show_media_details(self):
         entry = self.selected_media()
         if entry is None:
@@ -1162,6 +1406,7 @@ class Window(QMainWindow):
         entries = result["entries"]
         if self.preview_model.entries != entries:
             self.preview_model.set_entries(entries)
+        self.refresh_preview_duplicates()
         self.preview_model.episode_numbers = detect_episode_numbers(entries)
         detected = bool(self.preview_model.episode_numbers)
         self.episode_order.setEnabled(detected)
@@ -1171,7 +1416,9 @@ class Window(QMainWindow):
         self.preview_info.setToolTip(warnings)
         if result["complete"]:
             missing = ", ".join(TAB_NAMES.get(item["tab"], item["tab"]) for item in result["warnings"])
-            self.preview_info.setText(f"Pozycje: {len(entries)}" + (f" · brak zakładek: {missing}" if missing else ""))
+            members = result.get("skipped_members", 0)
+            self.preview_info.setText(f"Pozycje: {len(entries)}" + (f" · dla wspierających pominięto: {members}" if members else "")
+                                      + (f" · brak zakładek: {missing}" if missing else ""))
         elif entries:
             reason = result.get("message", "Nie udało się odczytać wszystkich zakładek.")
             self.preview_info.setText(f"Niepełna lista · {len(entries)} pozycji. {reason}")
@@ -1180,6 +1427,11 @@ class Window(QMainWindow):
         self.retry_preview = result["login_retry"]
         if detected:
             self.preview_order.setCurrentIndex(self.preview_order.findData("episode"))
+
+    def refresh_preview_duplicates(self):
+        if self.preview_model.entries:
+            ids = (entry.id for entry in self.preview_model.entries)
+            self.preview_model.set_duplicates(*self.c.store.duplicate_ids(ids))
 
     def preview_defaults(self):
         if self.active_profile is not None:
@@ -1342,7 +1594,8 @@ class Window(QMainWindow):
                 self.notify(str(exc))
                 return
             count, package_id = self.c.store.enqueue_batch(entries, options, first=first, overrides=overrides,
-                                                          package_id=package_id, package_name=name)
+                                                          package_id=package_id, package_name=name,
+                                                          omit_queued_duplicates=True)
             if name is not None and package_id is not None:
                 if self.preview_package == "auto":
                     self.auto_package = package_id
@@ -1350,11 +1603,14 @@ class Window(QMainWindow):
                     self.choose_preview_package(package_id)
             self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
+            self.refresh_preview_duplicates()
             message = f"Dodano {count} pozycji na początek kolejki." if first else f"Dodano pozycji: {count}."
             if first and self.c.paused:
                 message += " Kolejka jest wstrzymana."
             elif first and package_id is not None and self.c.store.packages()[package_id].paused:
                 message += " Pakiet jest wstrzymany."
+            if count < len(selected):
+                message += f" Pominięte duplikaty w kolejce: {len(selected) - count}."
             self.notify(message)
             self.refresh()
             if first:
@@ -1398,8 +1654,10 @@ class Window(QMainWindow):
         self.retry_selected.setEnabled(any(job.state == "failed" for job in jobs))
         self.pause_selected.setEnabled(any(job.state in ("queued", "running", "repair") for job in jobs))
         self.resume_selected.setEnabled(any(job.state == "paused" for job in jobs))
-        self.pause_selected.setText("Wstrzymaj pakiet" if package else "Wstrzymaj")
-        self.resume_selected.setText("Wznów pakiet" if package else "Wznów")
+        for control, label in ((self.pause_selected, "Wstrzymaj"), (self.resume_selected, "Wznów")):
+            name = f"{label} pakiet" if package else f"{label} zaznaczone"
+            control.setAccessibleName(name)
+            control.setToolTip(name)
         if package:
             members = self.queue_model.package_jobs[package.id]
             self.pause_selected.setEnabled(not package.paused)
@@ -1407,11 +1665,10 @@ class Window(QMainWindow):
             self.edit_selected.setEnabled(any(job.state in EDITABLE_STATES and job.id not in self.c.active
                                               for job in members))
             self.retry_selected.setEnabled(any(job.state == "failed" for job in members))
-        selected = {job.id for job in jobs}
-        waiting = [job.id for job in self.queue_model.jobs if job.state in WAITING_STATES]
-        positions = [i for i, job_id in enumerate(waiting) if job_id in selected]
-        before = bool(positions) and positions[-1] >= len(positions)
-        after = bool(positions) and positions[0] < len(waiting) - len(positions)
+        waiting = self.queue_model.waiting_positions
+        positions = [waiting[job.id] for job in jobs if job.id in waiting]
+        before = bool(positions) and max(positions) >= len(positions)
+        after = bool(positions) and min(positions) < len(waiting) - len(positions)
         can_move_package = package is not None and any(job.state in WAITING_STATES for job in members)
         self.move_first.setEnabled(before or can_move_package)
         self.move_up.setEnabled(before or can_move_package)
@@ -1438,6 +1695,13 @@ class Window(QMainWindow):
             if index.isValid():
                 self.queue_table.selectRow(index.row())
                 self.queue_table.scrollTo(index)
+
+    def reorder_queue_drop(self, items, target, after):
+        package = items[0] if isinstance(items[0], Package) else None
+        target_package = target.id if isinstance(target, Package) else (target.package_id if package else None)
+        if self.c.store.reorder_relative([item.id for item in items], package.id if package else None,
+                                         target.id, target_package, after):
+            self.refresh()
 
     def selected_action(self, action):
         if package := self.selected_package():
@@ -1510,6 +1774,11 @@ class Window(QMainWindow):
             self.build_package_menu(menu, item)
         else:
             jobs = self.selected_jobs()
+            disk_jobs = [job for job in jobs if job.state == "failed" and job.error_code == "disk"]
+            if disk_jobs:
+                menu.addAction("Zmień folder i ponów…", lambda: self.retry_in_folder(disk_jobs))
+            if len(jobs) == 1 and jobs[0].state == "auth":
+                menu.addAction("Otwórz film w przeglądarce", lambda: self.open_login(jobs[0].entry.url))
             records = [(job.entry.id, job.entry.title, job.path) for job in jobs if job.state == "done" and job.path]
             self.add_file_actions(menu, records)
             if records:
@@ -1525,9 +1794,17 @@ class Window(QMainWindow):
             for control in (self.pause_selected, self.resume_selected, self.edit_selected, self.retry_selected,
                             self.move_first, self.move_up, self.move_down, self.move_last, self.remove_selected):
                 if control.isEnabled():
-                    menu.addAction(control.text(), control.click)
+                    menu.addAction(control.text() or control.accessibleName(), control.click)
         menu.exec(self.queue_table.viewport().mapToGlobal(point))
         menu.deleteLater()
+
+    def retry_in_folder(self, jobs):
+        folder = QFileDialog.getExistingDirectory(self, "Nowy folder pobierania", jobs[0].options.folder)
+        if folder:
+            jobs = self.editable_jobs(jobs)
+            if self.c.store.edit_job_options(jobs, {"folder": folder}):
+                self.c.store.retry_failed([job.id for job in jobs])
+                self.refresh()
 
     def build_package_menu(self, menu, package):
         label = "Rozwiń pakiet" if package.id in self.queue_model.collapsed else "Zwiń pakiet"
@@ -1535,7 +1812,7 @@ class Window(QMainWindow):
         for control in (self.pause_selected, self.resume_selected, self.move_first, self.move_up,
                         self.move_down, self.move_last, self.edit_selected, self.retry_selected):
             if control.isEnabled():
-                menu.addAction(control.text(), control.click)
+                menu.addAction(control.text() or control.accessibleName(), control.click)
         jobs = self.queue_model.package_jobs[package.id]
         if self.editable_jobs(jobs) and self.download_profiles:
             profiles = menu.addMenu("Zastosuj profil do pakietu")
@@ -1576,7 +1853,7 @@ class Window(QMainWindow):
 
     def history_selection(self):
         return [(key, title, path) for index in self.history_table.selectionModel().selectedRows()
-                for title, key, _, path in (self.history.rows[index.row()],) if path]
+                for title, key, _, path, _ in (self.history.rows[index.row()],) if path]
 
     def history_menu(self, point):
         if not self.context_index(self.history_table, point).isValid():
@@ -1585,8 +1862,29 @@ class Window(QMainWindow):
         if records:
             menu = QMenu(self)
             self.add_file_actions(menu, records)
+            if len(records) == 1:
+                menu.addAction("Wskaż położenie pliku…", lambda: self.relink_history(records[0]))
+            menu.addAction("Pobierz ponownie", lambda: self.redownload_history(records))
             menu.exec(self.history_table.viewport().mapToGlobal(point))
             menu.deleteLater()
+
+    def relink_history(self, record):
+        video_id, _, old_path = record
+        filename, _ = QFileDialog.getOpenFileName(self, "Wskaż położenie pobranego pliku", str(Path(old_path).parent),
+                                                 "Media (*.mp4 *.mkv *.webm *.mp3 *.m4a *.opus);;Wszystkie pliki (*)")
+        if filename and Path(filename).is_file():
+            self.c.store.relink_download(video_id, old_path, str(Path(filename).resolve()))
+            self.refresh()
+
+    def redownload_history(self, records):
+        previous = {job.path: job for job in self.queue_model.jobs if job.state == "done" and job.path}
+        for video_id, title, path in records:
+            job = previous.get(path)
+            entry = job.entry if job and job.entry.id == video_id else Entry(video_id, title)
+            options = replace(job.options if job else self.c.prefs.options, force=True)
+            self.c.store.enqueue([entry], options)
+        self.notify(f"Dodano do ponownego pobrania: {len(records)}.")
+        self.tabs.setCurrentWidget(self.queue_tab)
 
     def reveal_downloads(self, records):
         if len(records) != 1:
@@ -1663,6 +1961,7 @@ class Window(QMainWindow):
             auto_update=self.auto_update.isChecked(), channel=self.update_channel.currentData(),
             browser=self.browser.currentData(), browser_profile=self.browser_profile.text().strip(),
             tray=self.use_tray.isChecked(), autostart=self.run_at_login.isChecked(),
+            skip_members=self.skip_members.isChecked(),
         )
         self.c.save()
         set_theme(self.app, self.c.prefs.theme)
@@ -1699,8 +1998,8 @@ class Window(QMainWindow):
             self.login_prompted = True
             self.open_login()
 
-    def open_login(self):
-        url = self.retry_preview[0].url if self.retry_preview else self.login_url
+    def open_login(self, url=None):
+        url = url or (self.retry_preview[0].url if self.retry_preview else self.login_url)
         if not url:
             return
         exe_name = {"chrome": "chrome", "edge": "msedge", "firefox": "firefox",
@@ -1785,10 +2084,17 @@ class Window(QMainWindow):
             if not selection.isEmpty():
                 self.queue_table.selectionModel().select(selection, flags.ClearAndSelect | flags.Rows)
         self.refresh_login_actions()
-        self.pause_all.setText("Wznów kolejkę" if self.c.paused else "Wstrzymaj kolejkę")
+        label = "Wznów kolejkę" if self.c.paused else "Wstrzymaj kolejkę"
+        self.pause_all.setAccessibleName(label)
+        self.pause_all.setToolTip(label)
+        icon = QStyle.StandardPixmap.SP_MediaPlay if self.c.paused else QStyle.StandardPixmap.SP_MediaPause
+        self.pause_all.setIcon(self.style().standardIcon(icon))
+        self.finish_current.setEnabled(not self.c.paused and bool(self.c.active))
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))
         self.selection_state()
         self.update_summary()
+        if self.tabs.currentWidget() is self.queue_tab:
+            self.update_next_download()
         page = self.tabs.currentWidget()
         if page is self.history_tab:
             self.refresh_history()
@@ -1803,7 +2109,8 @@ class Window(QMainWindow):
                                         for r in self.c.store.subscriptions()])
 
     def refresh_history(self):
-        rows = [(r["title"] or "Z archiwum yt-dlp", r["id"], stamp(r["time"]), r["path"])
+        rows = [(r["title"] or "Z archiwum yt-dlp", r["id"], stamp(r["time"]), r["path"],
+                 self.history_status.get(r["path"], "") if r["path"] else "Wpis z archiwum")
                 for r in self.c.store.history()]
         if self.history.rows == rows:
             return
@@ -1811,16 +2118,47 @@ class Window(QMainWindow):
         selected = {self.history.rows[index.row()][1] for index in model.selectedRows()}
         self.history.replace(rows)
         selection = QItemSelection()
-        for position, (_, video_id, _, _) in enumerate(rows):
+        for position, (_, video_id, _, _, _) in enumerate(rows):
             if video_id in selected:
                 index = self.history.index(position, 0)
                 selection.select(index, index)
         model.select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         self.show_history_file.setEnabled(len(self.history_selection()) == 1)
 
+    def poll_history_files(self):
+        if self.tabs.currentWidget() is not self.history_tab:
+            return
+        if self.history_check is not None and self.history_check.done():
+            self.history_status = self.history_check.result()
+            self.history_check = None
+            self.history_timer.setInterval(5000)
+            self.refresh_history()
+        elif self.history_check is None:
+            paths = {row[3] for row in self.history.rows if row[3]}
+            if not paths:
+                return
+            result = self.history_check = Future()
+            self.history_timer.setInterval(500)
+            Thread(target=lambda: result.set_result(history_file_status(paths)), daemon=True,
+                   name="history-files").start()
+
     def on_progress(self, job_id, event):
         self.queue_model.update_progress(job_id, event)
         self.update_total_progress()
+
+    def update_next_download(self):
+        if self.c.paused:
+            title = "Dokańczanie rozpoczętych pobrań" if any(not item.stopped for item in self.c.active.values()) else "Kolejka wstrzymana"
+        elif self.c.install_pending:
+            title = "Oczekiwanie na aktualizację aplikacji"
+        elif not self.c.manager.snapshot().ready:
+            title = "Przygotowywanie zależności"
+        else:
+            jobs = self.c.store.runnable_jobs(1, self.c.editing_jobs, self.c.moving_videos)
+            title = f"Następne do pobrania · {jobs[0].entry.title}" if jobs else "Brak zadań gotowych do startu"
+        if self.next_download.text() != title:
+            self.next_download.setText(title)
+            self.next_download.setToolTip(title)
 
     def update_summary(self):
         jobs = self.queue_model.jobs

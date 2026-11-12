@@ -5,18 +5,20 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import time
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import crypt
-from .model import DEFAULT_TEMPLATE, LANGUAGE_CODE, LEGACY_TEMPLATE, Entry, Options, VIDEO_ID, output_stem
+from .model import DEFAULT_TEMPLATE, LANGUAGE_CODE, LEGACY_TEMPLATE, MEMBERS_ONLY, Entry, Options, VIDEO_ID, output_stem
 from .runtime import atomic_json
 
 
 PARTIAL_FILE = re.compile(r"(?:f[\w+-]+\.)?[\w]+\.(?:part(?:-Frag\d+)?|ytdl)")
 SPLIT_STREAM = re.compile(r"f[\w+-]+\.[\w]+")
+MIN_FREE_SPACE = 16 * 1024 ** 2
 
 
 def load_engine(path):
@@ -55,6 +57,9 @@ def probe_engine(path, report):
 
 def explain(error, *, source_kind=None):
     text = str(error).casefold()
+    if any(message in text for message in (MEMBERS_ONLY.casefold(), "members-only", "members only",
+                                          "members_only", "join this channel to get access")):
+        return "members", MEMBERS_ONLY
     if "playlist is private" in text or "private playlist" in text:
         return "auth", "Playlista jest prywatna. Zaloguj się na konto z dostępem do niej."
     if source_kind in ("playlist", "album") and any(message in text for message in (
@@ -70,7 +75,7 @@ def explain(error, *, source_kind=None):
          ("age-restricted", "age restriction", "confirm your age", "verify your age",
           "age verification", "age-verification", "verification of your age")),
         ("auth", "Zaloguj się w przeglądarce, aby otworzyć ten materiał.",
-         ("sign in", "log in", "login required", "requires authentication", "members-only",
+         ("sign in", "log in", "login required", "requires authentication",
           "cookies are no longer valid", "private video", "video is private", "not a bot")),
         ("cookies", "Nie udało się odczytać ciasteczek. Sprawdź profil lub użyj Firefoksa.",
          ("failed to load cookies", "dpapi", "cookie database", "cookies database")),
@@ -88,7 +93,8 @@ def explain(error, *, source_kind=None):
         ("format", "Film nie ma formatu pasującego do wybranych ustawień.",
          ("requested format is not available", "no matching format")),
         ("disk", "Nie można zapisać pliku. Sprawdź dostęp i wolne miejsce.",
-         ("no space", "permission denied", "access is denied", "file name too long", "winerror 5")),
+         ("no space", "permission denied", "access is denied", "file name too long", "winerror 5",
+          "winerror 112", "not enough space on the disk")),
     )
     for code, message, needles in patterns:
         if any(needle in text for needle in needles):
@@ -176,6 +182,7 @@ def scan(ydl, request, parameters, emit):
                             "youtubetab": {"approximate_date": ["1"]}},
         )
     count = 0
+    skipped_members = 0
     last_error = None
     for tab in tabs:
         url = f"{source['url']}/{tab}" if tab else source["url"]
@@ -211,6 +218,9 @@ def scan(ydl, request, parameters, emit):
                     video_id = entry.get("id") if entry else None
                     if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
                         continue
+                    if request.get("skip_members", True) and entry.get("availability") == "subscriber_only":
+                        skipped_members += 1
+                        continue
                     number = entry.get("playlist_index") or index
                     album = (entry.get("album") or (collection if album_source else "")) if music else ""
                     title = (entry.get("track") if music else None) or entry.get("title") or video_id
@@ -233,7 +243,10 @@ def scan(ydl, request, parameters, emit):
             emit("scan_warning", tab=tab, code=code, message=message)
     if not count and last_error:
         raise last_error
-    emit("done", count=count)
+    if skipped_members:
+        emit("done", count=count, skipped_members=skipped_members)
+    else:
+        emit("done", count=count)
 
 
 def format_expression(options):
@@ -380,10 +393,26 @@ def download(ydl, request, parameters, emit):
     extension = options.audio_format if options.audio_only else options.container
     stem = download_stem(entry, options, request["job_id"], extension)
     stem.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(stem.parent).free < MIN_FREE_SPACE:
+        raise OSError("No space left for this download (less than 16 MiB free).")
     final = Path(f"{stem}.{extension}")
     marker = stem.with_name(stem.name + ".yt-resume.json")
+    resuming = marker.is_file()
     last_update = 0.0
     streams_done = 0
+    skipped_reason = None
+
+    def match_video(info, *, incomplete=False):
+        nonlocal skipped_reason
+        if request.get("skip_members", True) and info.get("availability") == "subscriber_only":
+            skipped_reason = MEMBERS_ONLY
+        elif not incomplete and not resuming:
+            formats = info.get("requested_formats") or (info,)
+            sizes = [item.get("filesize") for item in formats]
+            if all(isinstance(size, int) and size > 0 for size in sizes):
+                if sum(sizes) + MIN_FREE_SPACE > shutil.disk_usage(stem.parent).free:
+                    skipped_reason = "No space left for the selected streams."
+        return skipped_reason
 
     def progress(data):
         nonlocal last_update, streams_done
@@ -444,6 +473,7 @@ def download(ydl, request, parameters, emit):
         "subtitleslangs": languages,
         "progress_hooks": [progress],
         "postprocessor_hooks": [processing],
+        "match_filter": match_video,
     }
     if entry.music:
         settings.update(check_formats="selected", paths={"temp": tempfile.gettempdir()})
@@ -459,6 +489,8 @@ def download(ydl, request, parameters, emit):
             when = args.pop("when", "post_process")
             client.add_post_processor(get_postprocessor(key)(client, **args), when=when)
         client.extract_info(entry.url, download=True)
+    if skipped_reason:
+        raise ValueError(skipped_reason)
     if not final.is_file() or not final.stat().st_size:
         raise OSError("Nie powstał końcowy plik multimedialny.")
     marker.unlink(missing_ok=True)

@@ -14,6 +14,7 @@ VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 LANGUAGE_CODE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*")
 CHANNEL_TABS = ("videos", "shorts", "streams")
 TERMINAL = ("done", "skipped", "failed")
+MEMBERS_ONLY = "Film jest dostępny tylko dla wspierających kanał."
 WAITING_STATES = ("queued", "paused", "repair", "auth")
 EDITABLE_STATES = (*WAITING_STATES, "failed")
 SEASON_EPISODE = re.compile(r"(?<!\w)S([0-9]{1,2})\s*E([0-9]{1,4})(?!\w)", re.IGNORECASE)
@@ -191,6 +192,7 @@ class Preferences:
     browser_profile: str = ""
     tray: bool = False
     autostart: bool = False
+    skip_members: bool = True
 
     def to_dict(self):
         return asdict(self)

@@ -10,7 +10,7 @@ import time
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .model import Entry, Source, parse_source
+from .model import MEMBERS_ONLY, Entry, Source, parse_source
 from .organize import apply_plan, recover_file_moves
 from .process import Worker
 from .store import Job, Store
@@ -41,6 +41,7 @@ class Scan:
     source: Source
     tabs: tuple
     subscription: dict | None
+    collector: bool = False
     recovery: int = 0
     worker: Worker | None = None
     entries: list = field(default_factory=list)
@@ -53,6 +54,7 @@ class Controller(QObject):
     changed = Signal()
     progress = Signal(int, object)
     scanned = Signal(object)
+    collected = Signal(object)
     scan_entries = Signal(int, object)
     media_inspected = Signal(object)
     message = Signal(str)
@@ -184,15 +186,16 @@ class Controller(QObject):
             "cache": str(self.root / "cache"),
             "auth": {"browser": self.prefs.browser, "profile": self.prefs.browser_profile,
                      "file": str(self.root / "cookies.dpapi")},
+            "skip_members": self.prefs.skip_members,
             **kwargs,
         }
 
-    def preview(self, source, tabs, subscription=None):
+    def preview(self, source, tabs, subscription=None, *, collector=False):
         if self.scan:
             raise ValueError("Trwa odczytywanie innej listy.")
         if not self.manager.snapshot().ready:
             raise ValueError("Trwa przygotowanie zależności. Spróbuj za chwilę.")
-        self.scan = Scan(source, tuple(tabs), subscription)
+        self.scan = Scan(source, tuple(tabs), subscription, collector=collector)
         self.start_scan_worker()
 
     def start_scan_worker(self):
@@ -253,7 +256,8 @@ class Controller(QObject):
         worker = scan.worker
         finished = worker.poll() is not None
         size = len(scan.entries)
-        for event in worker.events():
+        events = list(worker.events(limit=512))
+        for event in events:
             kind = event["kind"]
             if kind == "entry":
                 scan.entries.append(Entry(**event["entry"]))
@@ -263,9 +267,9 @@ class Controller(QObject):
                 LOG.warning("Podgląd / %s", event["detail"])
             else:
                 scan.outcome = event
-        if len(scan.entries) != size and not scan.subscription:
+        if len(scan.entries) != size and not (scan.subscription or scan.collector):
             self.scan_entries.emit(size, scan.entries[size:])
-        if finished:
+        if finished and (len(events) < 512 or scan.outcome):
             worker.close()
             scan.worker = None
             event = scan.outcome or {"kind": "error", "message": "Proces podglądu został przerwany."}
@@ -305,9 +309,12 @@ class Controller(QObject):
         else:
             if code == "playlist_access":
                 login = event
-            self.scanned.emit({**event, "entries": entries, "warnings": scan.warnings, "complete": complete,
-                               "login_retry": (scan.source, scan.tabs) if login else None})
-        if login:
+            elif code == "members" and not self.prefs.skip_members:
+                login = event
+            signal = self.collected if scan.collector else self.scanned
+            signal.emit({**event, "entries": entries, "warnings": scan.warnings, "complete": complete,
+                         "login_retry": (scan.source, scan.tabs) if login else None})
+        if login and not scan.collector:
             self.login_needed.emit(scan.source.url, login["message"], login["code"] == "auth")
 
     def recovery_channel(self, recovery):
@@ -347,7 +354,12 @@ class Controller(QObject):
         reason = result.get("message", "Proces pobierania został przerwany.")
         code = result.get("code")
         LOG.warning("Film %s / %s", job.entry.id, result.get("detail", reason))
-        if code == "network" and job.attempts < 3:
+        if code == "members" and self.prefs.skip_members:
+            self.store.state(job.id, "skipped", MEMBERS_ONLY)
+        elif code == "members" and not job.auth_attempts:
+            self.store.state(job.id, "auth", MEMBERS_ONLY, error_code=code)
+            self.login_needed.emit(job.entry.url, MEMBERS_ONLY, False)
+        elif code == "network" and job.attempts < 3:
             delay = 5 * 3 ** job.attempts
             self.store.state(job.id, "queued", f"Ponowienie za {delay} s. {reason}", delay=delay,
                              attempts=job.attempts + 1)
@@ -358,12 +370,12 @@ class Controller(QObject):
             self.store.state(job.id, "repair", reason, recovery=job.recovery + 1)
             self.pending_repairs[job.id] = self.recovery_channel(job.recovery)
         elif code in ("auth", "cookies") and not job.auth_attempts:
-            self.store.state(job.id, "auth", reason)
+            self.store.state(job.id, "auth", reason, error_code=code)
             self.login_needed.emit(job.entry.url, reason, code == "auth")
         else:
             if code == "auth":
                 reason += " Ponowienie po zalogowaniu nie dało dostępu."
-            self.store.state(job.id, "failed", reason)
+            self.store.state(job.id, "failed", reason, error_code=code or "")
 
     def pause_job(self, job_id):
         item = self.active.get(job_id)
@@ -394,10 +406,10 @@ class Controller(QObject):
             self.changed.emit()
         return count
 
-    def pause_all(self, paused):
+    def pause_all(self, paused, *, finish_current=False):
         self.paused = paused
         self.store.set("queue_paused", paused)
-        if paused:
+        if paused and not finish_current:
             for job_id, item in self.active.items():
                 if not item.stopped:
                     item.stopped = True
@@ -422,11 +434,12 @@ class Controller(QObject):
         active = {item.job.entry.id for item in self.active.values()}
         self.moving_videos = {group.video_id for group in groups if not group.status}
         result = self.file_move = Future()
+        undo_batch = time.time_ns()
 
         def transfer():
             try:
                 with closing(Store(self.root)) as store:
-                    counts = apply_plan(store, root, groups, active)
+                    counts = apply_plan(store, root, groups, active, undo_batch=undo_batch)
                 result.set_result(counts)
             except Exception as exc:
                 result.set_exception(exc)
@@ -498,6 +511,8 @@ class Controller(QObject):
             source = replace(parse_source(row["url"]), music=bool(row["music"]))
             self.preview(source, json.loads(row["tabs"]), dict(row))
         if self.paused or self.install_pending or any(item.stopped for item in self.active.values()):
+            return
+        if len(self.active) >= self.prefs.parallel:
             return
         changed = self.store.skip_downloaded(self.editing_jobs)
         while len(self.active) < self.prefs.parallel:

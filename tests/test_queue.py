@@ -101,6 +101,7 @@ class QueueTests(unittest.TestCase):
         root = self.root / "legacy-queue"
         with closing(Store(root)) as legacy:
             legacy.enqueue([replace(self.entry, id=f"v{i:010}") for i in range(1, 4)], self.options)
+            legacy.db.execute("DROP INDEX job_order")
             legacy.db.execute("ALTER TABLE jobs DROP COLUMN queue_position")
             legacy.db.execute("DROP INDEX job_package")
             legacy.db.execute("ALTER TABLE jobs DROP COLUMN package_id")

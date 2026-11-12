@@ -286,6 +286,62 @@ class PaginationPreviewTests(unittest.TestCase):
         self.window.move_down.click()
         self.assertEqual([job.id for job in store.jobs()], [1, 4, 2, 3])
 
+    def test_collector_reads_links_and_applies_folder_per_source_without_rescanning(self):
+        self.send_page(1, 1, {"kind": "done"})
+        collector = self.window.collector_tab
+        collector.input.setPlainText(f"{PLAYLIST}\nhttps://youtu.be/{entry(2).id}\n{PLAYLIST}")
+        collector.read.click()
+        self.assertEqual(len(collector.items), 2)
+        self.assertIn("Powtórzone: 1", collector.notice.text())
+        self.send_page(1, 3, {"kind": "done"})
+        collector.start_next()
+        self.send_page(2, 3, {"kind": "done"})
+        collector.table.selectRow(0)
+        folder = str(self.controller.root.resolve() / "Folder pakietu")
+        with patch("yt_downloader.collector.QFileDialog.getExistingDirectory", return_value=folder):
+            collector.folder.click()
+        collector.preview.click()
+        self.assertEqual(self.window.options_for_preview().folder, folder)
+        self.assertIsNone(self.controller.scan)
+        collector.table.selectAll()
+        collector.add.click()
+        jobs = self.controller.store.jobs()
+        self.assertEqual([job.entry.id for job in jobs], [entry(1).id, entry(2).id])
+        self.assertTrue(all(job.options.folder == folder for job in jobs))
+        self.assertEqual(collector.items[1].status, "Dodano: 0 · Powtórzenia: 1")
+
+    def test_dragging_a_package_updates_the_next_runnable_download(self):
+        store = self.controller.store
+        _, a = store.enqueue_batch([entry(1), entry(2)], self.controller.prefs.options, package_name="Playlista A")
+        _, b = store.enqueue_batch([entry(3)], self.controller.prefs.options, package_name="Playlista B")
+        self.window.tabs.setCurrentWidget(self.window.queue_tab)
+        self.assertIn("Film 1", self.window.next_download.text())
+        packages = store.packages()
+        self.window.reorder_queue_drop([packages[b]], packages[a], False)
+        self.assertEqual([job.entry.id for job in store.jobs()], [entry(i).id for i in (3, 1, 2)])
+        self.assertIn("Film 3", self.window.next_download.text())
+        self.controller.pause_package(b, True)
+        self.assertIn("Film 1", self.window.next_download.text())
+
+    def test_relinking_missing_history_updates_the_job_and_redownload_preserves_its_profile(self):
+        store = self.controller.store
+        options = replace(self.controller.prefs.options, audio_only=True)
+        store.enqueue([entry(1)], options)
+        old_path = str(self.controller.root.resolve() / "stary.mp3")
+        store.complete(store.claim(), old_path)
+        self.window.tabs.setCurrentWidget(self.window.history_tab)
+        self.window.history_table.selectRow(0)
+        record = self.window.history_selection()[0]
+        new_path = self.controller.root.resolve() / "nowy.mp3"
+        new_path.write_bytes(b"fixture")
+        with patch("yt_downloader.ui.QFileDialog.getOpenFileName", return_value=(str(new_path), "")):
+            self.window.relink_history(record)
+        self.assertEqual(store.history()[0]["path"], str(new_path))
+        self.assertEqual(store.jobs()[0].path, str(new_path))
+        self.window.redownload_history(self.window.history_selection())
+        self.assertTrue(store.jobs()[-1].options.audio_only)
+        self.assertTrue(store.jobs()[-1].options.force)
+
     def test_preview_packages_can_be_collapsed_paused_and_reordered(self):
         store = self.controller.store
         self.send_page(1, 4, {"kind": "done"})
