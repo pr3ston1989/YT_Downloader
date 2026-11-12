@@ -1,11 +1,11 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import repeat
 import json
 from pathlib import Path
 import sqlite3
 import time
 
-from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, Preferences, VIDEO_ID, WAITING_STATES
+from .model import DEFAULT_TEMPLATE, EDITABLE_STATES, LEGACY_TEMPLATE, Entry, Options, Preferences, VIDEO_ID, WAITING_STATES
 
 
 @dataclass(frozen=True)
@@ -143,23 +143,25 @@ class Store:
                                        ((row["position"], job_id) for row, job_id in zip(rows, order)
                                         if row["id"] != job_id)).rowcount
 
-    def skip_downloaded(self):
+    def skip_downloaded(self, excluded=()):
         with self.db:
             return self.db.execute("""
                 UPDATE jobs SET state='skipped', reason=? WHERE state='queued'
+                    AND id NOT IN (SELECT value FROM json_each(?))
                     AND NOT json_extract(options, '$.force')
                     AND EXISTS (SELECT 1 FROM downloads WHERE id=jobs.video_id)
-            """, ("Film jest już w historii.",)).rowcount
+            """, ("Film jest już w historii.", json.dumps(list(excluded)))).rowcount
 
-    def claim(self):
+    def claim(self, excluded=()):
         with self.db:
             row = self.db.execute("""
                 UPDATE jobs SET state='running', reason='' WHERE id=(
                     SELECT j.id FROM jobs j WHERE j.state='queued' AND j.ready<=?
+                    AND j.id NOT IN (SELECT value FROM json_each(?))
                     AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
                     ORDER BY COALESCE(j.queue_position, j.id) LIMIT 1
                 ) RETURNING *
-            """, (time.time(),)).fetchone()
+            """, (time.time(), json.dumps(list(excluded)))).fetchone()
             return self.job(row) if row else None
 
     def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None):
@@ -179,12 +181,26 @@ class Store:
         with self.db:
             self.db.execute("UPDATE jobs SET state='queued', ready=0 WHERE state IN ('running','repair')")
 
-    def retry_failed(self):
+    def retry_failed(self, ids=None):
+        selection = None if ids is None else json.dumps(list(ids))
         with self.db:
-            self.db.execute("""
+            return self.db.execute("""
                 UPDATE jobs SET state='queued', reason='', attempts=0, recovery=0, auth_attempts=0, ready=0
                 WHERE state='failed'
-            """)
+                    AND (?1 IS NULL OR id IN (SELECT value FROM json_each(?1)))
+            """, (selection,)).rowcount
+
+    def edit_job_options(self, jobs, changes):
+        if not changes:
+            return 0
+        rows = []
+        for job in jobs:
+            options = replace(job.options, **changes)
+            options.validate()
+            rows.append((json.dumps(asdict(options), ensure_ascii=False), job.id, *EDITABLE_STATES))
+        states = ",".join("?" for _ in EDITABLE_STATES)
+        with self.db:
+            return self.db.executemany(f"UPDATE jobs SET options=? WHERE id=? AND state IN ({states})", rows).rowcount
 
     def retry_auth(self):
         with self.db:
@@ -197,6 +213,11 @@ class Store:
     def clear_jobs(self):
         with self.db:
             self.db.execute("DELETE FROM jobs WHERE state IN ('done','skipped','failed')")
+
+    def remove_jobs(self, ids):
+        with self.db:
+            return self.db.execute("DELETE FROM jobs WHERE id IN (SELECT value FROM json_each(?))",
+                                   (json.dumps(list(ids)),)).rowcount
 
     def history(self):
         return self.db.execute("SELECT * FROM downloads ORDER BY time DESC").fetchall()

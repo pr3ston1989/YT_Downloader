@@ -1,5 +1,5 @@
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 import json
 import logging
@@ -26,7 +26,9 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
 from .controller import Controller, LABELS
-from .model import APP_DIR, CHANNEL_TABS, Options, TERMINAL, WAITING_STATES, detect_episode_numbers, parse_source
+from .model import (
+    APP_DIR, CHANNEL_TABS, EDITABLE_STATES, Options, TERMINAL, WAITING_STATES, detect_episode_numbers, parse_source,
+)
 from .runtime import RESOURCES, atomic_bytes, command
 from .updates.application import restart_for
 
@@ -388,9 +390,9 @@ class DownloadOptionsForm(QGroupBox):
 
 
 class PreviewOptionsDialog(QDialog):
-    def __init__(self, options, defaults, parent):
+    def __init__(self, options, defaults, parent, *, queue=False, batch=False):
         super().__init__(parent)
-        self.setWindowTitle("Parametry bieżącego podglądu")
+        self.setWindowTitle("Parametry zadań w kolejce" if queue else "Parametry bieżącego podglądu")
         self.resize(670, 440)
         self.options = None
         self.defaults = defaults
@@ -402,12 +404,17 @@ class PreviewOptionsDialog(QDialog):
         self.error.setWordWrap(True)
         self.error.hide()
         buttons = QDialogButtonBox()
-        buttons.addButton("Przywróć domyślne", QDialogButtonBox.ButtonRole.ResetRole).clicked.connect(self.reset)
+        if defaults is not None:
+            buttons.addButton("Przywróć domyślne", QDialogButtonBox.ButtonRole.ResetRole).clicked.connect(self.reset)
         buttons.addButton("Anuluj", QDialogButtonBox.ButtonRole.RejectRole)
-        apply = buttons.addButton("Zastosuj do podglądu", QDialogButtonBox.ButtonRole.AcceptRole)
+        apply = buttons.addButton("Zapisz parametry" if queue else "Zastosuj do podglądu", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
+        if batch:
+            hint = QLabel("Do zaznaczonych zadań zostaną zastosowane pola zmienione w tym oknie.")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
         layout.addWidget(self.scroll, 1)
         layout.addWidget(self.error)
         layout.addWidget(buttons)
@@ -428,6 +435,48 @@ class PreviewOptionsDialog(QDialog):
             return
         self.options = options
         super().accept()
+
+
+class MediaDetailsDialog(QDialog):
+    def __init__(self, entry, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Dostępne formaty i napisy")
+        self.resize(680, 440)
+        title = QLabel(entry.title)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setWordWrap(True)
+        self.status = QLabel("Odczytywanie dostępnych formatów…")
+        self.status.setWordWrap(True)
+        self.tabs = QTabWidget()
+        self.models = (
+            TableModel(("Rozdzielczość", "Klatki/s", "Kodek", "Format źródłowy")),
+            TableModel(("Język", "Bitrate (kb/s)", "Kodek", "Format źródłowy")),
+            TableModel(("Kod języka", "Język", "Rodzaj")),
+        )
+        for i, label in enumerate(("Wideo", "Audio", "Napisy")):
+            self.tabs.addTab(table(self.models[i], 2 if i < 2 else 1), label)
+        self.tabs.hide()
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(self.status)
+        layout.addWidget(self.tabs, 1)
+        layout.addStretch()
+        layout.addWidget(row(None, button("Zamknij", self.reject)))
+
+    def set_result(self, result):
+        if result["kind"] != "done":
+            self.status.setText(result["message"])
+            return
+        self.models[0].replace([(f"{height}p", f"{fps:g}" if fps else "—", codec, ext)
+                                for height, fps, codec, ext in result["video"]])
+        self.models[1].replace([(language or "—", f"{bitrate:g}" if bitrate else "—", codec, ext)
+                                for language, codec, bitrate, ext in result["audio"]])
+        self.models[2].replace([(language, name, "Automatyczne" if auto else "Ręczne")
+                                for language, name, auto in result["subtitles"]])
+        for i, label in enumerate(("Wideo", "Audio", "Napisy")):
+            self.tabs.setTabText(i, f"{label} ({self.models[i].rowCount()})")
+        self.status.hide()
+        self.tabs.show()
 
 
 class Window(QMainWindow):
@@ -547,11 +596,14 @@ class Window(QMainWindow):
         self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
         self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
         self.preview_parameters = button("Parametry pobierania…", self.edit_preview_options)
+        self.media_details = button("Formaty i napisy…", self.show_media_details)
         self.preview_parameters.setEnabled(False)
         self.preview_mode.setEnabled(False)
         self.preview_model.dataChanged.connect(lambda *_: self.refresh_preview_actions())
+        self.preview_table.selectionModel().currentChanged.connect(lambda *_: self.refresh_preview_actions())
         self.set_preview_selectable(False)
-        filter_row = row(self.preview_search, self.preview_order, self.preview_mode, self.preview_parameters)
+        filter_row = row(self.preview_search, self.preview_order, self.preview_mode, self.preview_parameters,
+                         self.media_details)
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
         layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button,
@@ -579,13 +631,18 @@ class Window(QMainWindow):
         self.move_up = button("Wyżej", lambda: self.move_queue("up"))
         self.move_down = button("Niżej", lambda: self.move_queue("down"))
         self.move_last = button("Na koniec", lambda: self.move_queue("last"))
+        self.remove_selected = button("Usuń z kolejki", self.remove_selected_jobs)
+        self.remove_selected.setToolTip("Usuń zaznaczone zadania. Aktywne pobrania zostaną zatrzymane, a pliki pozostaną na dysku.")
+        self.edit_selected = button("Parametry…", self.edit_selected_jobs)
+        self.retry_selected = button("Ponów wybrane", self.retry_selected_jobs)
         for control in (self.move_first, self.move_up, self.move_down, self.move_last):
             control.setToolTip("Zmień kolejność zaznaczonych zadań oczekujących na pobranie.")
         self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
         queue_layout.addWidget(row(self.pause_selected, self.resume_selected,
                                    self.pause_all, self.retry_failed,
                                    button("Wyczyść zakończone", self.clear_queue), None))
-        queue_layout.addWidget(row(self.move_first, self.move_up, self.move_down, self.move_last, None))
+        queue_layout.addWidget(row(self.move_first, self.move_up, self.move_down, self.move_last, None,
+                                   self.edit_selected, self.retry_selected, self.remove_selected))
         queue_layout.addWidget(self.queue_table, 1)
         self.summary = QLabel()
         self.total = QProgressBar()
@@ -771,6 +828,36 @@ class Window(QMainWindow):
         can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
         self.add_button.setEnabled(can_add)
         self.add_first.setEnabled(can_add)
+        self.media_details.setEnabled(self.selected_media() is not None)
+
+    def selected_media(self):
+        if not self.preview_model.checkable:
+            return None
+        index = self.preview_table.currentIndex()
+        if self.preview_filter.rowCount() == 1:
+            index = self.preview_filter.index(0, 0)
+        source = self.preview_filter.mapToSource(index)
+        if source.isValid() and source.row() < len(self.preview_model.entries):
+            return self.preview_model.entries[source.row()]
+        return None
+
+    def show_media_details(self):
+        entry = self.selected_media()
+        if entry is None:
+            return
+        try:
+            self.c.inspect_media(entry)
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        dialog = MediaDetailsDialog(entry, self)
+        self.c.media_inspected.connect(dialog.set_result)
+        try:
+            dialog.exec()
+        finally:
+            self.c.cancel_media_inspection()
+            self.c.media_inspected.disconnect(dialog.set_result)
+            dialog.deleteLater()
 
     def visible_rows(self):
         if not self.preview_search.text().strip() and not self.preview_model.positions:
@@ -859,6 +946,9 @@ class Window(QMainWindow):
 
     def selection_state(self):
         jobs = self.selected_jobs()
+        self.remove_selected.setEnabled(bool(jobs))
+        self.edit_selected.setEnabled(any(job.state in EDITABLE_STATES and job.id not in self.c.active for job in jobs))
+        self.retry_selected.setEnabled(any(job.state == "failed" for job in jobs))
         self.pause_selected.setEnabled(any(job.state in ("queued", "running", "repair") for job in jobs))
         self.resume_selected.setEnabled(any(job.state == "paused" for job in jobs))
         selected = {job.id for job in jobs}
@@ -889,6 +979,38 @@ class Window(QMainWindow):
     def retry_failures(self):
         self.c.store.retry_failed()
         self.refresh()
+
+    def retry_selected_jobs(self):
+        if self.c.store.retry_failed([job.id for job in self.selected_jobs()]):
+            self.refresh()
+
+    def edit_selected_jobs(self):
+        jobs = [job for job in self.selected_jobs() if job.state in EDITABLE_STATES and job.id not in self.c.active]
+        if not jobs:
+            return
+        ids = {job.id for job in jobs}
+        batch = len(jobs) > 1
+        original = jobs[0].options
+        dialog = PreviewOptionsDialog(original, None if batch else self.c.prefs.options, self, queue=True, batch=batch)
+        self.c.editing_jobs.update(ids)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                baseline = asdict(original)
+                changes = {key: value for key, value in asdict(dialog.options).items() if value != baseline[key]}
+                count = self.c.store.edit_job_options(jobs, changes)
+                if count:
+                    self.notify(f"Zapisano parametry dla {count} zadań.")
+        except ValueError as exc:
+            self.notify(str(exc))
+        finally:
+            self.c.editing_jobs.difference_update(ids)
+            dialog.deleteLater()
+            self.refresh()
+
+    def remove_selected_jobs(self):
+        count = self.c.remove_jobs([job.id for job in self.selected_jobs()])
+        if count:
+            self.notify(f"Usunięto {count} zadań z kolejki.")
 
     def clear_queue(self):
         self.c.store.clear_jobs()

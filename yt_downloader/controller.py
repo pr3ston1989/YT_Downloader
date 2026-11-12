@@ -52,6 +52,7 @@ class Controller(QObject):
     progress = Signal(int, object)
     scanned = Signal(object)
     scan_entries = Signal(int, object)
+    media_inspected = Signal(object)
     message = Signal(str)
     login_needed = Signal(str, str, bool)
     update_ready = Signal(object)
@@ -65,7 +66,9 @@ class Controller(QObject):
         self.prefs = self.store.preferences()
         self.manager = EngineManager(root / "engine", self.record)
         self.active = {}
+        self.editing_jobs = set()
         self.scan = None
+        self.media_worker = None
         self.pending_repairs = {}
         self.smoke = smoke
         self.future = None
@@ -200,6 +203,34 @@ class Controller(QObject):
         except Exception:
             LOG.exception("Nie udało się uruchomić odczytu listy")
             self.finish_scan({"kind": "error", "message": "Nie udało się uruchomić odczytu listy."})
+
+    def inspect_media(self, entry):
+        if self.media_worker is not None:
+            raise ValueError("Trwa odczytywanie formatów.")
+        if not self.manager.snapshot().ready:
+            raise ValueError("Trwa przygotowanie zależności. Spróbuj za chwilę.")
+        try:
+            self.media_worker = Worker(self.root / "workers", self.request("inspect", entry=asdict(entry)))
+        except OSError as exc:
+            LOG.exception("Nie udało się uruchomić odczytu formatów")
+            raise ValueError("Nie udało się uruchomić odczytu formatów.") from exc
+
+    def cancel_media_inspection(self):
+        if self.media_worker is not None:
+            worker, self.media_worker = self.media_worker, None
+            worker.close()
+
+    def poll_media_inspection(self):
+        if self.media_worker is None or self.media_worker.poll() is None:
+            return
+        result = {"kind": "error", "message": "Odczyt formatów został przerwany."}
+        for event in self.media_worker.events():
+            if event["kind"] in ("done", "error"):
+                result = event
+            elif event["kind"] == "log":
+                LOG.warning("Odczyt formatów / %s", event["detail"])
+        self.cancel_media_inspection()
+        self.media_inspected.emit(result)
 
     def cancel_scan(self):
         scan = self.scan
@@ -342,6 +373,22 @@ class Controller(QObject):
         self.store.state(job_id, "queued")
         self.changed.emit()
 
+    def remove_jobs(self, ids):
+        ids = tuple(ids)
+        count = self.store.remove_jobs(ids)
+        for job_id in ids:
+            item = self.active.get(job_id)
+            if item and not item.stopped:
+                item.stopped = True
+                try:
+                    item.worker.stop()
+                except OSError:
+                    LOG.exception("Nie udało się zatrzymać usuwanego zadania %s", job_id)
+            self.pending_repairs.pop(job_id, None)
+        if count:
+            self.changed.emit()
+        return count
+
     def pause_all(self, paused):
         self.paused = paused
         self.store.set("queue_paused", paused)
@@ -375,9 +422,10 @@ class Controller(QObject):
     def step(self):
         self.poll_jobs()
         self.poll_scan()
+        self.poll_media_inspection()
         self.poll_update()
         if self.install_pending:
-            if not self.active and not self.scan and self.future is None:
+            if not (self.active or self.scan or self.editing_jobs or self.media_worker) and self.future is None:
                 candidate, self.install_pending = self.install_pending, None
                 self.update_ready.emit(candidate)
             if not self.scan or self.scan.worker:
@@ -398,9 +446,9 @@ class Controller(QObject):
             self.preview(source, json.loads(row["tabs"]), dict(row))
         if self.paused or self.install_pending or any(item.stopped for item in self.active.values()):
             return
-        changed = self.store.skip_downloaded()
+        changed = self.store.skip_downloaded(self.editing_jobs)
         while len(self.active) < self.prefs.parallel:
-            job = self.store.claim()
+            job = self.store.claim(self.editing_jobs)
             if not job:
                 break
             try:
@@ -418,6 +466,7 @@ class Controller(QObject):
     def close(self):
         self.timer.stop()
         self.poll_jobs(closing=True)
+        self.cancel_media_inspection()
         if self.scan and self.scan.worker:
             self.scan.worker.close()
         for item in self.active.values():

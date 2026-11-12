@@ -98,6 +98,37 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.c.store.jobs()[0].state, "done")
         self.assertEqual(self.c.store.history()[0]["id"], VIDEO.id)
 
+    def test_removing_active_and_waiting_jobs_does_not_restart_them(self):
+        current = self.enqueue(VIDEO, NEXT_VIDEO, Entry("BaW_jenozKc", "Trzeci film"))
+        self.assertEqual(self.c.remove_jobs([1, 2]), 2)
+        current.pending.append({"kind": "error", "code": "network", "message": "Błąd testowy"})
+        self.c.step()
+        self.assertTrue(current.closed)
+        self.assertEqual([job.id for job in self.c.store.jobs()], [3])
+        self.assertEqual(list(self.c.active), [3])
+
+    def test_removing_a_just_completed_job_keeps_its_history(self):
+        worker = self.enqueue(VIDEO)
+        worker.finish(kind="done", path="gotowy.mp4")
+        self.c.remove_jobs([1])
+        self.c.step()
+        self.assertEqual(self.c.store.jobs(), [])
+        self.assertEqual(self.c.store.history()[0]["path"], "gotowy.mp4")
+
+    def test_jobs_being_edited_wait_while_the_rest_of_the_queue_runs(self):
+        self.c.store.enqueue([VIDEO, NEXT_VIDEO], self.c.prefs.options)
+        self.c.store.import_archive([f"youtube {VIDEO.id}"])
+        self.c.editing_jobs.add(1)
+        self.c.step()
+        self.assertEqual(list(self.c.active), [2])
+        edited = self.c.store.jobs()[0]
+        self.assertEqual(edited.state, "queued")
+        self.c.store.edit_job_options([edited], {"force": True})
+        self.c.editing_jobs.clear()
+        self.c.active[2].worker.finish(kind="done", path="gotowy.mp4")
+        self.c.step()
+        self.assertEqual(list(self.c.active), [1])
+
     def test_shutdown_keeps_finished_downloads_and_requeues_interrupted_ones(self):
         self.c.prefs.parallel = 2
         first = self.enqueue(VIDEO, NEXT_VIDEO)

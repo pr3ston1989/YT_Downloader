@@ -7,13 +7,14 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from PySide6.QtCore import QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, Options, detect_episode_numbers, output_stem, parse_source
-from yt_downloader.ui import PreviewOptionsDialog, Window
+from yt_downloader.ui import MediaDetailsDialog, PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
-from yt_downloader.worker import load_engine, scan
+from yt_downloader.worker import inspect_media, load_engine, scan
 
 
 PLAYLIST = "https://www.youtube.com/playlist?list=PLTest"
@@ -24,6 +25,26 @@ def entry(number):
 
 
 class PaginationWorkerTests(unittest.TestCase):
+    def test_media_inspection_summarizes_only_downloadable_streams_and_distinguishes_captions(self):
+        ydl = MagicMock()
+        client = ydl.return_value.__enter__.return_value
+        client.extract_info.return_value = {
+            "formats": [
+                {"url": "https://fixture.test/1", "height": 1080, "fps": 60, "vcodec": "vp9", "ext": "webm"},
+                {"url": "https://fixture.test/2", "height": 1080, "fps": 60, "vcodec": "vp9", "ext": "webm"},
+                {"url": "https://fixture.test/3", "language": "pl", "acodec": "opus", "abr": 128, "ext": "webm"},
+                {"url": "https://fixture.test/4", "height": 2160, "vcodec": "av1", "has_drm": True},
+            ],
+            "subtitles": {"pl": [{"name": "Polski"}]},
+            "automatic_captions": {"en": [{"name": "English"}]},
+        }
+        emit = MagicMock()
+        inspect_media(ydl, {"entry": asdict(entry(1))}, {}, emit)
+        client.extract_info.assert_called_once_with(entry(1).url, download=False)
+        emit.assert_called_once_with("done", video=[(1080, 60, "vp9", "webm")],
+                                     audio=[("pl", "opus", 128, "webm")],
+                                     subtitles=[("pl", "Polski", False), ("en", "English", True)])
+
     def test_episode_detection_rejects_years_and_isolated_numbers(self):
         entries = [Entry(entry(i).id, title) for i, title in enumerate((
             "Podsumowanie | 2023", "Koncert 2024", "Zapowiedź #4", "Dokument (2025)", "Powrót 1999"), 1)]
@@ -232,6 +253,54 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertFalse(self.window.move_first.isEnabled())
         self.window.move_down.click()
         self.assertEqual([job.id for job in store.jobs()], [1, 4, 2, 3])
+
+    def test_batch_edit_and_selected_retry_keep_individual_options_and_queue_positions(self):
+        store = self.controller.store
+        base = self.controller.prefs.options
+        store.enqueue([entry(1)], base)
+        store.enqueue([entry(2)], replace(base, resolution=720))
+        store.enqueue([entry(3)], base)
+        for job_id in (1, 2, 3):
+            store.state(job_id, "failed", "Błąd testowy", attempts=2)
+        self.window.tabs.setCurrentWidget(self.window.queue_tab)
+        selection = self.window.queue_table.selectionModel()
+        for row in (0, 1):
+            selection.select(self.window.queue_model.index(row, 0), QItemSelectionModel.SelectionFlag.Select |
+                             QItemSelectionModel.SelectionFlag.Rows)
+
+        def edit(dialog):
+            self.assertEqual(self.controller.editing_jobs, {1, 2})
+            dialog.form.container.setCurrentIndex(dialog.form.container.findData("mkv"))
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(PreviewOptionsDialog, "exec", edit):
+            self.window.edit_selected.click()
+        self.window.retry_selected.click()
+        jobs = store.jobs()
+        self.assertEqual([job.options.container for job in jobs], ["mkv", "mkv", "mp4"])
+        self.assertEqual(jobs[1].options.resolution, 720)
+        self.assertEqual([job.state for job in jobs], ["queued", "queued", "failed"])
+        self.assertEqual([job.attempts for job in jobs], [0, 0, 2])
+        self.assertEqual([job.id for job in jobs], [1, 2, 3])
+
+    def test_format_details_request_the_highlighted_video_without_replacing_the_preview(self):
+        self.send_page(1, 4, {"kind": "done"})
+        self.window.preview_table.selectRow(1)
+
+        def inspect(dialog):
+            self.worker.events.return_value = [{"kind": "done", "video": [[1080, 60, "vp9", "webm"]],
+                                                "audio": [], "subtitles": [["en", "English", True]]}]
+            self.controller.poll_media_inspection()
+            self.assertEqual(dialog.models[0].rows[0][:2], ("1080p", "60"))
+            self.assertEqual(dialog.models[2].rows[0], ("en", "English", "Automatyczne"))
+
+        with (patch.object(MediaDetailsDialog, "exec", inspect),
+              patch("yt_downloader.controller.Worker", return_value=self.worker) as worker):
+            self.window.media_details.click()
+        self.assertEqual(worker.call_args.args[1]["entry"]["id"], entry(2).id)
+        self.assertEqual(self.window.preview_model.rowCount(), 3)
+        self.assertIsNone(self.controller.media_worker)
 
     def test_music_preview_defaults_to_audio_without_changing_global_settings(self):
         self.controller.cancel_scan()

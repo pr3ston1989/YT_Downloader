@@ -248,6 +248,29 @@ def format_expression(options):
     return default
 
 
+def inspect_media(ydl, request, parameters, emit):
+    entry = Entry(**request["entry"])
+    settings = {**parameters, "noplaylist": True, "skip_download": True,
+                "extractor_args": {"youtube": {"skip": ["translated_subs"]}}}
+    with ydl(settings) as client:
+        info = client.extract_info(entry.url, download=False)
+    video, audio = set(), set()
+    for fmt in info.get("formats") or [info]:
+        if fmt.get("has_drm") or not fmt.get("url"):
+            continue
+        if (codec := fmt.get("vcodec")) and codec != "none" and fmt.get("height"):
+            video.add((fmt["height"], fmt.get("fps") or 0, codec, fmt.get("ext") or ""))
+        if (codec := fmt.get("acodec")) and codec != "none":
+            audio.add((fmt.get("language") or "", codec, fmt.get("abr") or 0, fmt.get("ext") or ""))
+    subtitles = []
+    for key, automatic in (("subtitles", False), ("automatic_captions", True)):
+        for language, tracks in sorted((info.get(key) or {}).items()):
+            if tracks:
+                name = next((track["name"] for track in tracks if track.get("name")), "")
+                subtitles.append((language, name, automatic))
+    emit("done", video=sorted(video, reverse=True), audio=sorted(audio), subtitles=subtitles)
+
+
 def add_audio_encoder(client, options):
     from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
@@ -453,7 +476,7 @@ def run_worker(work):
         try:
             ydl = load_engine(request["runtime"]["engine"])
             parameters = base_parameters(request, logger)
-            operation = scan if request["operation"] == "scan" else download
+            operation = {"scan": scan, "download": download, "inspect": inspect_media}[request["operation"]]
             operation(ydl, request, parameters, emit)
             return 0
         except Exception as exc:

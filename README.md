@@ -35,6 +35,10 @@ Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadani
 
 W karcie **Kolejka** możesz przenieść zaznaczone oczekujące zadania **Na początek**, **Wyżej**, **Niżej** albo **Na koniec**. Przycisk **Pobierz następne** w podglądzie dodaje zaznaczone widoczne pozycje od razu na początek kolejki. Zadania ruszą, gdy zwolni się miejsce na pobranie. Jeśli kolejka jest wstrzymana, wznów ją. Aplikacja zachowuje kolejność po ponownym uruchomieniu.
 
+**Usuń z kolejki** usuwa zaznaczone zadania z listy i zatrzymuje aktywne pobrania. Pliki i historia pobrań zostają na dysku. **Parametry…** zmienia ustawienia wybranych zadań przed ich uruchomieniem lub ponowieniem. Przy wielu zadaniach zapis obejmuje pola zmienione w oknie. **Ponów wybrane** ponawia tylko zaznaczone nieudane zadania.
+
+W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja odczyta dostępne rozdzielczości, kodeki i języki audio oraz rozróżni napisy ręczne i automatyczne. Odczyt dotyczy wskazanego filmu i pobiera metadane.
+
 Domyślny szablon to `{source}/{index} - {title} [{id}].{ext}`. Pole `{source}` tworzy jeden folder nazwany od otwartej playlisty, albumu lub kanału. Pojedynczy film trafia do folderu kanału. Po aktualizacji poprzedni domyślny szablon w ustawieniach zmieni się automatycznie. Rozpoczęte pobrania mogą wznowić się w swoim dotychczasowym folderze.
 
 Ścieżka jest względna wobec folderu docelowego. Dozwolone pola to `{source}`, `{channel}`, `{playlist}`, `{index}`, `{title}`, `{id}` i końcowe `{ext}`. Opcja ponownego pobrania dopisuje numer zadania do nazwy pliku. Tryb audio zapisuje napisy jako osobne pliki SRT. Napisy w MP4 są osadzane jako strumień tekstowy, a MKV obsługuje osadzone SRT.
