@@ -1470,7 +1470,10 @@ def launch(args):
     app.setQuitOnLastWindowClosed(False)
     if "--tray" not in args or not window.tray.isVisible():
         window.show()
-    if smoke:
+    if smoke and "--queue-test" in args:
+        from .smoke import run_queue_smoke
+        run_queue_smoke(app, window, args[args.index("--queue-test") + 1])
+    elif smoke:
         def smoke_result():
             if controller.future is None:
                 app.exit(0 if controller.manager.snapshot().ready else 1)

@@ -101,6 +101,8 @@ Testy podglądu sprawdzają kolejność wierszy z wielu stron, zachowanie częś
 
 Testy transferu zatrzymują osobny proces podczas pobierania z lokalnego serwera i porównują gotowy plik bajt po bajcie. Sprawdzają wznowienie oraz zmianę formatu w trakcie ponowienia. Test aktualizacji Windows sprawdza także zachowanie wstrzymanej kolejki po instalacji nowej wersji.
 
+Przed publikacją GitHub Actions uruchamia także zainstalowany program w izolowanym profilu. Test otwiera playlistę, wybiera zapisany profil, pomija wpis z historii i dodaje pilny film. Po restarcie wznawia kolejkę, sprawdza kolejność żądań do lokalnego serwera i weryfikuje oba pliki MKV za pomocą FFprobe.
+
 ## Publikowanie nowej wersji
 
 Zmień `APP_VERSION` w `yt_downloader/__init__.py` i zatwierdź zmiany w Git. Jedno polecenie tworzy oraz wysyła tag. GitHub Actions buduje i publikuje instalator oraz jego sumę.

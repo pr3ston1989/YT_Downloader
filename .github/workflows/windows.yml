@@ -62,6 +62,8 @@ jobs:
             if (Test-Path "$data\app.log") { Get-Content "$data\app.log" }
             exit $app.ExitCode
           }
+      - name: Exercise the installed download workflow
+        run: python -X utf8 packaging/verify_queue_workflow.py "$env:RUNNER_TEMP\YT Downloader\YTDownloader.exe"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
