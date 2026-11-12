@@ -11,7 +11,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 from .auth import crypt
-from .model import DEFAULT_TEMPLATE, LEGACY_TEMPLATE, Entry, Options, VIDEO_ID, output_stem
+from .model import DEFAULT_TEMPLATE, LANGUAGE_CODE, LEGACY_TEMPLATE, Entry, Options, VIDEO_ID, output_stem
 from .runtime import atomic_json
 
 
@@ -238,13 +238,19 @@ def scan(ydl, request, parameters, emit):
 
 def format_expression(options):
     language = options.audio_language.strip().lower()
-    lang = f"[language^={language}]" if re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]+)*", language) else ""
+    lang = ""
+    if LANGUAGE_CODE.fullmatch(language):
+        end = "$" if options.audio_language_exact else "(?:-|$)"
+        lang = f"[language~='(?i)^{language}{end}']"
     height = f"[height<={options.resolution}]" if options.resolution else ""
     if options.audio_only:
-        return f"bestaudio{lang}/best{lang}/bestaudio/best" if lang else "bestaudio/best"
-    default = f"bestvideo{height}+bestaudio/best{height}"
+        default = "bestaudio/best"
+        preferred = f"bestaudio{lang}/best{lang}"
+    else:
+        default = f"bestvideo{height}+bestaudio/best{height}"
+        preferred = f"bestvideo{height}+bestaudio{lang}/best{height}{lang}"
     if lang:
-        return f"bestvideo{height}+bestaudio{lang}/best{height}{lang}/{default}"
+        return preferred if options.audio_language_exact else f"{preferred}/{default}"
     return default
 
 
@@ -432,8 +438,8 @@ def download(ydl, request, parameters, emit):
         "writethumbnail": options.thumbnail,
         "writeinfojson": options.metadata and options.keep_sidecars,
         "writedescription": options.metadata and options.keep_sidecars,
-        "writesubtitles": options.subtitles,
-        "writeautomaticsub": options.subtitles and options.auto_subtitles,
+        "writesubtitles": options.subtitles and not options.auto_subtitles_only,
+        "writeautomaticsub": options.subtitles and (options.auto_subtitles or options.auto_subtitles_only),
         "extractor_args": {"youtube": {"skip": ["translated_subs"]}},
         "subtitleslangs": languages,
         "progress_hooks": [progress],

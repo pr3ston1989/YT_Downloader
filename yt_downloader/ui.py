@@ -17,7 +17,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox,
     QStyle, QStyleOptionProgressBar, QStyledItemDelegate, QSystemTrayIcon, QTabWidget,
     QTableView, QVBoxLayout, QWidget,
@@ -27,7 +27,8 @@ from . import APP_NAME, APP_VERSION
 from .auth import crypt, youtube_cookie_file
 from .controller import Controller, LABELS
 from .model import (
-    APP_DIR, CHANNEL_TABS, EDITABLE_STATES, Options, TERMINAL, WAITING_STATES, detect_episode_numbers, parse_source,
+    APP_DIR, CHANNEL_TABS, EDITABLE_STATES, LANGUAGE_CODE, Options, TERMINAL, WAITING_STATES,
+    detect_episode_numbers, parse_source,
 )
 from .runtime import RESOURCES, atomic_bytes, command
 from .updates.application import restart_for
@@ -270,6 +271,27 @@ class QueueModel(TableModel):
         return super().data(index, role)
 
 
+class QueueFilter(QSortFilterProxyModel):
+    def __init__(self, model, parent):
+        super().__init__(parent)
+        self.title = ""
+        self.state = None
+        self.setSourceModel(model)
+
+    def set_filters(self, title, state):
+        self.beginFilterChange()
+        self.title = title.strip().casefold()
+        self.state = state
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        jobs = self.sourceModel().jobs
+        if source_row >= len(jobs):
+            return False
+        job = jobs[source_row]
+        return (self.state is None or job.state == self.state) and self.title in job.entry.title.casefold()
+
+
 class ProgressDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         bar = QStyleOptionProgressBar()
@@ -341,7 +363,8 @@ class DownloadOptionsForm(QGroupBox):
         self.folder = QLineEdit(options.folder)
         self.template = QLineEdit(options.template)
         self.template.setToolTip("{source} wstawia nazwę playlisty, albumu lub kanału otwartego w podglądzie.")
-        self.resolution = combo([("Najlepsza", 0), *((f"{p}p", p) for p in (2160, 1440, 1080, 720, 480))],
+        heights = sorted({2160, 1440, 1080, 720, 480} | ({options.resolution} - {0}), reverse=True)
+        self.resolution = combo([("Najlepsza", 0), *((f"{p}p", p) for p in heights)],
                                 options.resolution)
         self.container = combo([(s.upper(), s) for s in ("mp4", "mkv")], options.container)
         self.audio_only = checkbox("Tylko audio", options.audio_only)
@@ -349,8 +372,11 @@ class DownloadOptionsForm(QGroupBox):
         self.bitrate = combo([(f"{n} kb/s", n) for n in (64, 96, 128, 160, 192, 256, 320)], options.bitrate)
         self.audio_lang = QLineEdit(options.audio_language)
         self.audio_lang.setPlaceholderText("np. pl lub en")
+        self.audio_exact = checkbox("Wymagaj tego języka", options.audio_language_exact)
         self.subs = checkbox("Pobieraj napisy", options.subtitles)
-        self.auto_subs = checkbox("Uwzględniaj automatyczne", options.auto_subtitles)
+        self.subtitle_type = combo([("Ręczne", "manual"), ("Ręczne i automatyczne", "both"),
+                                    ("Tylko automatyczne", "auto")],
+                                   "auto" if options.auto_subtitles_only else "both" if options.auto_subtitles else "manual")
         self.embed_subs = checkbox("Osadzaj w filmie", options.embed_subtitles)
         self.sub_lang = QLineEdit(options.subtitle_languages)
         self.metadata = checkbox("Osadzaj metadane", options.metadata)
@@ -363,8 +389,8 @@ class DownloadOptionsForm(QGroupBox):
         form.addRow("Szablon ścieżki", self.template)
         form.addRow("Rozdzielczość maks. / kontener", row(self.resolution, self.container, None))
         form.addRow("Audio / format / bitrate", row(self.audio_only, self.audio_format, self.bitrate, None))
-        form.addRow("Preferowany język audio", self.audio_lang)
-        form.addRow("Napisy", row(self.subs, self.auto_subs, self.embed_subs, None))
+        form.addRow("Preferowany język audio", row(self.audio_lang, self.audio_exact))
+        form.addRow("Napisy", row(self.subs, self.subtitle_type, self.embed_subs, None))
         form.addRow("Języki napisów", self.sub_lang)
         self.sub_lang.setPlaceholderText("np. pl,en")
         form.addRow(row(self.metadata, self.thumbnail, None))
@@ -382,10 +408,11 @@ class DownloadOptionsForm(QGroupBox):
             resolution=self.resolution.currentData(), container=self.container.currentData(),
             audio_only=self.audio_only.isChecked(), audio_format=self.audio_format.currentData(),
             bitrate=self.bitrate.currentData(), audio_language=self.audio_lang.text().strip(),
-            subtitles=self.subs.isChecked(), auto_subtitles=self.auto_subs.isChecked(),
+            subtitles=self.subs.isChecked(), auto_subtitles=self.subtitle_type.currentData() == "both",
             subtitle_languages=self.sub_lang.text().strip(), embed_subtitles=self.embed_subs.isChecked(),
             thumbnail=self.thumbnail.isChecked(), metadata=self.metadata.isChecked(), force=self.force.isChecked(),
             keep_sidecars=self.keep_sidecars.isChecked(),
+            audio_language_exact=self.audio_exact.isChecked(), auto_subtitles_only=self.subtitle_type.currentData() == "auto",
         )
 
 
@@ -438,7 +465,7 @@ class PreviewOptionsDialog(QDialog):
 
 
 class MediaDetailsDialog(QDialog):
-    def __init__(self, entry, parent):
+    def __init__(self, entry, parent, choices=None):
         super().__init__(parent)
         self.setWindowTitle("Dostępne formaty i napisy")
         self.resize(680, 440)
@@ -447,6 +474,10 @@ class MediaDetailsDialog(QDialog):
         title.setWordWrap(True)
         self.status = QLabel("Odczytywanie dostępnych formatów…")
         self.status.setWordWrap(True)
+        self.choices = choices or {}
+        self.resolution = QComboBox()
+        self.language = QComboBox()
+        self.captions = QComboBox()
         self.tabs = QTabWidget()
         self.models = (
             TableModel(("Rozdzielczość", "Klatki/s", "Kodek", "Format źródłowy")),
@@ -456,12 +487,21 @@ class MediaDetailsDialog(QDialog):
         for i, label in enumerate(("Wideo", "Audio", "Napisy")):
             self.tabs.addTab(table(self.models[i], 2 if i < 2 else 1), label)
         self.tabs.hide()
+        self.selection = QWidget()
+        form = QFormLayout(self.selection)
+        form.addRow("Maks. rozdzielczość", self.resolution)
+        form.addRow("Język audio", self.language)
+        form.addRow("Napisy", self.captions)
+        self.selection.hide()
+        self.apply = button("Zastosuj do tego filmu", self.accept, primary=True)
+        self.apply.setEnabled(False)
         layout = QVBoxLayout(self)
         layout.addWidget(title)
         layout.addWidget(self.status)
         layout.addWidget(self.tabs, 1)
+        layout.addWidget(self.selection)
         layout.addStretch()
-        layout.addWidget(row(None, button("Zamknij", self.reject)))
+        layout.addWidget(row(None, button("Zamknij", self.reject), self.apply))
 
     def set_result(self, result):
         if result["kind"] != "done":
@@ -475,8 +515,51 @@ class MediaDetailsDialog(QDialog):
                                 for language, name, auto in result["subtitles"]])
         for i, label in enumerate(("Wideo", "Audio", "Napisy")):
             self.tabs.setTabText(i, f"{label} ({self.models[i].rowCount()})")
+        default = "Z parametrów podglądu"
+        heights = sorted({row[0] for row in result["video"]}, reverse=True)
+        languages = sorted({row[0] for row in result["audio"] if LANGUAGE_CODE.fullmatch(row[0])})
+        self.resolution.addItem(default, None)
+        self.language.addItem(default, None)
+        self.captions.addItem(default, None)
+        self.captions.addItem("Bez napisów", False)
+        if self.choices.get("subtitles") is False:
+            self.captions.setCurrentIndex(1)
+        for height in heights:
+            self.resolution.addItem(f"{height}p", height)
+            if height == self.choices.get("resolution"):
+                self.resolution.setCurrentIndex(self.resolution.count() - 1)
+        for language in languages:
+            self.language.addItem(language, language)
+            if language == self.choices.get("audio_language"):
+                self.language.setCurrentIndex(self.language.count() - 1)
+        for language, name, auto in result["subtitles"]:
+            kind = "automatyczne" if auto else "ręczne"
+            label = f"{name} ({language})" if name else language
+            self.captions.addItem(f"{label} · {kind}", (language, auto))
+            if (self.choices.get("subtitles") and language == self.choices.get("subtitle_languages")
+                    and auto == self.choices.get("auto_subtitles_only")):
+                self.captions.setCurrentIndex(self.captions.count() - 1)
         self.status.hide()
         self.tabs.show()
+        self.selection.show()
+        self.apply.setEnabled(True)
+
+    def accept(self):
+        if not self.apply.isEnabled():
+            return
+        choices = {}
+        if (height := self.resolution.currentData()) is not None:
+            choices["resolution"] = height
+        if language := self.language.currentData():
+            choices.update(audio_language=language, audio_language_exact=True)
+        captions = self.captions.currentData()
+        if captions is False:
+            choices["subtitles"] = False
+        elif captions is not None:
+            language, auto = captions
+            choices.update(subtitles=True, subtitle_languages=language, auto_subtitles=False, auto_subtitles_only=auto)
+        self.choices = choices
+        super().accept()
 
 
 class Window(QMainWindow):
@@ -487,6 +570,9 @@ class Window(QMainWindow):
         self.login_prompted = False
         self.retry_preview = None
         self.preview_options = None
+        self.media_choices = {}
+        self.download_profiles = {name: Options(**values) for name, values in self.c.store.get("download_profiles", {}).items()}
+        self.active_profile = None
         self.preview_music = False
         self.login_url = ""
         self.quitting = False
@@ -558,7 +644,11 @@ class Window(QMainWindow):
         self.preview_button = button("Pokaż podgląd", self.preview, primary=True)
         self.cancel_button = button("Anuluj odczyt", self.c.cancel_scan)
         self.cancel_button.hide()
-        source_row = row(self.source, self.source_kind, self.preview_button, self.cancel_button)
+        self.profiles_button = QPushButton("Profile…")
+        self.profiles_menu = QMenu(self.profiles_button)
+        self.profiles_menu.aboutToShow.connect(self.build_profiles_menu)
+        self.profiles_button.setMenu(self.profiles_menu)
+        source_row = row(self.source, self.source_kind, self.profiles_button, self.preview_button, self.cancel_button)
         source_row.layout().setStretch(0, 1)
         layout.addWidget(source_row)
         self.channel_tabs = {key: checkbox(name, True) for key, name in TAB_NAMES.items()}
@@ -615,7 +705,8 @@ class Window(QMainWindow):
         page = QWidget()
         queue_layout = QVBoxLayout(page)
         self.queue_model = QueueModel()
-        self.queue_table = table(self.queue_model, 0)
+        self.queue_filter = QueueFilter(self.queue_model, self)
+        self.queue_table = table(self.queue_filter, 0)
         self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.queue_table.setColumnWidth(1, 139)
         self.queue_table.setColumnWidth(2, 116)
@@ -626,7 +717,7 @@ class Window(QMainWindow):
         self.pause_all = button("Wstrzymaj kolejkę", lambda: self.c.pause_all(not self.c.paused))
         self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
         self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
-        self.retry_failed = button("Ponów nieudane", self.retry_failures)
+        self.retry_failed = button("Ponów wszystkie nieudane", self.retry_failures)
         self.move_first = button("Na początek", lambda: self.move_queue("first"))
         self.move_up = button("Wyżej", lambda: self.move_queue("up"))
         self.move_down = button("Niżej", lambda: self.move_queue("down"))
@@ -636,8 +727,15 @@ class Window(QMainWindow):
         self.edit_selected = button("Parametry…", self.edit_selected_jobs)
         self.retry_selected = button("Ponów wybrane", self.retry_selected_jobs)
         for control in (self.move_first, self.move_up, self.move_down, self.move_last):
-            control.setToolTip("Zmień kolejność zaznaczonych zadań oczekujących na pobranie.")
+            control.setToolTip("Zmień pozycję zaznaczonych zadań w całej kolejce.")
         self.queue_table.selectionModel().selectionChanged.connect(lambda *_: self.selection_state())
+        self.queue_search = QLineEdit()
+        self.queue_search.setPlaceholderText("Szukaj po tytule w kolejce")
+        self.queue_search.setClearButtonEnabled(True)
+        self.queue_status = combo([("Wszystkie stany", None), *((label, state) for state, label in LABELS.items())], None)
+        search_row = row(self.queue_search, self.queue_status)
+        search_row.layout().setStretch(0, 1)
+        queue_layout.addWidget(search_row)
         queue_layout.addWidget(row(self.pause_selected, self.resume_selected,
                                    self.pause_all, self.retry_failed,
                                    button("Wyczyść zakończone", self.clear_queue), None))
@@ -649,6 +747,8 @@ class Window(QMainWindow):
         self.total.setFormat("%p% · łączny postęp")
         queue_layout.addWidget(self.summary)
         queue_layout.addWidget(self.total)
+        self.queue_search.textChanged.connect(self.filter_queue)
+        self.queue_status.currentIndexChanged.connect(self.filter_queue)
         return page
 
     def settings_page(self):
@@ -776,9 +876,8 @@ class Window(QMainWindow):
         self.preview_search.clear()
         self.preview_music = source.music
         if not preserve_options:
-            self.preview_options = None
-            self.preview_mode.setCurrentIndex(1 if source.music else 0)
-            self.preview_parameters.setText("Parametry pobierania…")
+            self.media_choices.clear()
+            self.reset_preview_options()
         self.preview_mode.setEnabled(True)
         self.preview_parameters.setEnabled(True)
         self.set_preview_selectable(False)
@@ -828,7 +927,9 @@ class Window(QMainWindow):
         can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
         self.add_button.setEnabled(can_add)
         self.add_first.setEnabled(can_add)
-        self.media_details.setEnabled(self.selected_media() is not None)
+        entry = self.selected_media()
+        self.media_details.setEnabled(entry is not None)
+        self.media_details.setText("Wybrane formaty…" if entry and entry.id in self.media_choices else "Formaty i napisy…")
 
     def selected_media(self):
         if not self.preview_model.checkable:
@@ -850,10 +951,15 @@ class Window(QMainWindow):
         except ValueError as exc:
             self.notify(str(exc))
             return
-        dialog = MediaDetailsDialog(entry, self)
+        dialog = MediaDetailsDialog(entry, self, self.media_choices.get(entry.id))
         self.c.media_inspected.connect(dialog.set_result)
         try:
-            dialog.exec()
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                if dialog.choices:
+                    self.media_choices[entry.id] = dialog.choices
+                else:
+                    self.media_choices.pop(entry.id, None)
+                self.refresh_preview_actions()
         finally:
             self.c.cancel_media_inspection()
             self.c.media_inspected.disconnect(dialog.set_result)
@@ -899,22 +1005,87 @@ class Window(QMainWindow):
         if detected:
             self.preview_order.setCurrentIndex(self.preview_order.findData("episode"))
 
-    def options_for_preview(self):
+    def preview_defaults(self):
+        if self.active_profile is not None:
+            return self.download_profiles[self.active_profile]
         defaults = self.c.prefs.options
+        return replace(defaults, audio_only=True) if self.preview_music else defaults
+
+    def reset_preview_options(self):
+        self.preview_options = None
+        self.preview_mode.setCurrentIndex(1 if self.preview_music and self.active_profile is None else 0)
+        self.preview_parameters.setText("Parametry pobierania…")
+
+    def options_for_preview(self):
+        defaults = self.preview_defaults()
         options = self.preview_options or defaults
         mode = self.preview_mode.currentData()
         return replace(options, audio_only=defaults.audio_only if mode is None else mode)
 
+    def build_profiles_menu(self):
+        self.profiles_menu.clear()
+        profiles = [("Ustawienia domyślne", None)]
+        profiles.extend((name, name) for name in sorted(self.download_profiles, key=str.casefold))
+        for label, name in profiles:
+            action = self.profiles_menu.addAction(label.replace("&", "&&"))
+            action.setCheckable(True)
+            action.setChecked(self.active_profile == name)
+            action.triggered.connect(lambda checked=False, value=name: self.select_profile(value))
+        self.profiles_menu.addSeparator()
+        self.profiles_menu.addAction("Zapisz parametry podglądu…", self.save_download_profile)
+        remove = self.profiles_menu.addAction("Usuń aktywny profil…", self.delete_download_profile)
+        remove.setEnabled(self.active_profile is not None)
+
+    def select_profile(self, name):
+        self.active_profile = name
+        self.reset_preview_options()
+        label = self.profiles_button.fontMetrics().elidedText(name or "Profile…", Qt.TextElideMode.ElideRight, 115)
+        self.profiles_button.setText(label.replace("&", "&&"))
+        self.profiles_button.setToolTip(f"Profil pobierania · {name}" if name else "Profile pobierania")
+
+    def write_profiles(self, profiles):
+        self.c.store.set("download_profiles", {name: asdict(options) for name, options in profiles.items()})
+        self.download_profiles = profiles
+
+    def save_download_profile(self):
+        options = self.options_for_preview()
+        try:
+            options.validate()
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        name, accepted = QInputDialog.getText(self, "Zapisz profil pobierania", "Nazwa profilu",
+                                              text=self.active_profile or "")
+        name = name.strip()
+        if not accepted or not name:
+            return
+        existing = next((key for key in self.download_profiles if key.casefold() == name.casefold()), None)
+        profiles = dict(self.download_profiles)
+        if existing is not None:
+            if QMessageBox.question(self, "Zastąp profil", f"Zapisać nowe parametry profilu „{existing}”?") != QMessageBox.StandardButton.Yes:
+                return
+            del profiles[existing]
+        profiles[name] = options
+        self.write_profiles(profiles)
+        self.select_profile(name)
+        self.notify(f"Zapisano profil „{name}”.")
+
+    def delete_download_profile(self):
+        name = self.active_profile
+        if name is None:
+            return
+        if QMessageBox.question(self, "Usuń profil", f"Usunąć profil „{name}”?") == QMessageBox.StandardButton.Yes:
+            self.write_profiles({key: value for key, value in self.download_profiles.items() if key != name})
+            self.select_profile(None)
+            self.notify(f"Usunięto profil „{name}”.")
+
     def edit_preview_options(self):
-        defaults = self.c.prefs.options
-        if self.preview_music:
-            defaults = replace(defaults, audio_only=True)
+        defaults = self.preview_defaults()
         dialog = PreviewOptionsDialog(self.options_for_preview(), defaults, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.preview_options = dialog.options if dialog.options != defaults else None
             if self.preview_options is None:
-                self.preview_mode.setCurrentIndex(1 if self.preview_music else 0)
-                self.preview_parameters.setText("Parametry pobierania…")
+                self.reset_preview_options()
             else:
                 self.preview_mode.setCurrentIndex(self.preview_mode.findData(dialog.options.audio_only))
                 self.preview_parameters.setText("Zmienione parametry…")
@@ -922,14 +1093,19 @@ class Window(QMainWindow):
 
     def enqueue(self, *, first=False):
         options = self.options_for_preview()
+        selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
+        entries = [self.preview_model.entry_at(i) for i in selected]
+        overrides = {entry.id: replace(options, **self.media_choices[entry.id])
+                     for entry in entries if entry.id in self.media_choices}
         try:
             options.validate()
+            for value in overrides.values():
+                value.validate()
         except ValueError as exc:
             self.notify(str(exc))
             return
-        selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
         if selected:
-            count = self.c.store.enqueue((self.preview_model.entry_at(i) for i in selected), options, first=first)
+            count = self.c.store.enqueue(entries, options, first=first, overrides=overrides)
             self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
             message = f"Dodano {count} pozycji na początek kolejki." if first else f"Dodano pozycji: {count}."
@@ -942,7 +1118,14 @@ class Window(QMainWindow):
                 self.queue_table.scrollToTop()
 
     def selected_jobs(self):
-        return [self.queue_model.jobs[index.row()] for index in self.queue_table.selectionModel().selectedRows()]
+        jobs = self.queue_model.jobs
+        return [jobs[source.row()] for index in self.queue_table.selectionModel().selectedRows()
+                if (source := self.queue_filter.mapToSource(index)).isValid() and source.row() < len(jobs)]
+
+    def filter_queue(self):
+        self.queue_filter.set_filters(self.queue_search.text(), self.queue_status.currentData())
+        self.selection_state()
+        self.update_summary()
 
     def selection_state(self):
         jobs = self.selected_jobs()
@@ -967,7 +1150,7 @@ class Window(QMainWindow):
             self.refresh()
             rows = [self.queue_model.positions[job_id] for job_id in selected]
             edge = min(rows) if direction in ("first", "up") else max(rows)
-            self.queue_table.scrollTo(self.queue_model.index(edge, 0))
+            self.queue_table.scrollTo(self.queue_filter.mapFromSource(self.queue_model.index(edge, 0)))
 
     def selected_action(self, action):
         for job in self.selected_jobs():
@@ -1166,8 +1349,9 @@ class Window(QMainWindow):
             selection = QItemSelection()
             for job_id in selected:
                 if job_id in self.queue_model.positions:
-                    index = self.queue_model.index(self.queue_model.positions[job_id], 0)
-                    selection.select(index, index)
+                    index = self.queue_filter.mapFromSource(self.queue_model.index(self.queue_model.positions[job_id], 0))
+                    if index.isValid():
+                        selection.select(index, index)
             flags = QItemSelectionModel.SelectionFlag
             self.queue_table.selectionModel().select(selection, flags.ClearAndSelect | flags.Rows)
         self.refresh_login_actions()
@@ -1198,7 +1382,7 @@ class Window(QMainWindow):
         counts = Counter(job.state for job in jobs)
         self.summary.setText(f"Gotowe: {counts['done']}   ·   Pominięte: {counts['skipped']}"
                              f"   ·   Nieudane: {counts['failed']}   ·   Logowanie: {counts['auth']}"
-                             f"   ·   Razem: {len(jobs)}")
+                             f"   ·   Widoczne: {self.queue_filter.rowCount()} z {len(jobs)}")
         self.finished_progress = 100 * sum(counts[state] for state in TERMINAL)
         self.update_total_progress()
 

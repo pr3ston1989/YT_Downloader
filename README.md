@@ -17,7 +17,7 @@ Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę o
 
 Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kolejki do widocznych wierszy. Po wyczyszczeniu filtra zobaczysz ponownie całą listę.
 
-**Podgląd** i **Kolejka** mają osobne karty. W podglądzie przycisk **Parametry pobierania…** pozwala wybrać m.in. format, jakość, język audio, napisy i folder dla dodawanych pozycji. Możesz dodać część listy z jednymi parametrami, a następnie zmienić je i dodać pozostałe. Nowy podgląd wraca do ustawień domyślnych.
+**Podgląd** i **Kolejka** mają osobne karty. W podglądzie przycisk **Parametry pobierania…** pozwala wybrać m.in. format, jakość, język audio, napisy i folder dla dodawanych pozycji. Możesz dodać część listy z jednymi parametrami, a następnie zmienić je i dodać pozostałe. Użyj **Profile… → Zapisz parametry podglądu…**, aby zachować ustawienia pod własną nazwą. Nowy podgląd przywraca ustawienia aktywnego profilu lub ustawienia domyślne.
 
 W podglądzie możesz zachować kolejność źródła, odwrócić listę albo posortować ją według dat publikacji. Daty z podglądu mogą być przybliżone. Pozycje bez dat trafiają na koniec. Jeśli playlista zaczyna się od najnowszych i nie zawiera dat, wybierz **Odwróć listę**. Po zmianie kolejności pole `{index}` używa numerów z całej posortowanej listy, także gdy dodajesz tylko zaznaczone pozycje.
 
@@ -35,9 +35,11 @@ Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadani
 
 W karcie **Kolejka** możesz przenieść zaznaczone oczekujące zadania **Na początek**, **Wyżej**, **Niżej** albo **Na koniec**. Przycisk **Pobierz następne** w podglądzie dodaje zaznaczone widoczne pozycje od razu na początek kolejki. Zadania ruszą, gdy zwolni się miejsce na pobranie. Jeśli kolejka jest wstrzymana, wznów ją. Aplikacja zachowuje kolejność po ponownym uruchomieniu.
 
+Kolejkę można filtrować jednocześnie po fragmencie tytułu i stanie zadania. Akcje na zaznaczonych wierszach obejmują pozycje widoczne po filtrowaniu. Zmiana pozycji zadania dotyczy całej kolejki.
+
 **Usuń z kolejki** usuwa zaznaczone zadania z listy i zatrzymuje aktywne pobrania. Pliki i historia pobrań zostają na dysku. **Parametry…** zmienia ustawienia wybranych zadań przed ich uruchomieniem lub ponowieniem. Przy wielu zadaniach zapis obejmuje pola zmienione w oknie. **Ponów wybrane** ponawia tylko zaznaczone nieudane zadania.
 
-W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja odczyta dostępne rozdzielczości, kodeki i języki audio oraz rozróżni napisy ręczne i automatyczne. Odczyt dotyczy wskazanego filmu i pobiera metadane.
+W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja odczyta dostępne rozdzielczości, kodeki i języki audio oraz rozróżni napisy ręczne i automatyczne. Wybierz limit rozdzielczości, język audio lub napisy i kliknij **Zastosuj do tego filmu**. Indywidualne wybory są zapisywane w zadaniu przy dodawaniu do kolejki i mają pierwszeństwo przed parametrami podglądu. Wybrany tu język audio jest wymagany. Opcja **Z parametrów podglądu** pozwala ponownie korzystać z ustawień wspólnych dla danej grupy.
 
 Domyślny szablon to `{source}/{index} - {title} [{id}].{ext}`. Pole `{source}` tworzy jeden folder nazwany od otwartej playlisty, albumu lub kanału. Pojedynczy film trafia do folderu kanału. Po aktualizacji poprzedni domyślny szablon w ustawieniach zmieni się automatycznie. Rozpoczęte pobrania mogą wznowić się w swoim dotychczasowym folderze.
 

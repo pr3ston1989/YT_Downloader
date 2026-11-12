@@ -84,8 +84,10 @@ class Store:
     def preferences(self):
         return Preferences.from_dict(self.get("settings", {}))
 
-    def enqueue(self, entries, options: Options, *, only_new=False, first=False):
+    def enqueue(self, entries, options: Options, *, only_new=False, first=False, overrides=None):
         encoded = json.dumps(asdict(options), ensure_ascii=False)
+        per_entry = {video_id: json.dumps(asdict(value), ensure_ascii=False)
+                     for video_id, value in (overrides or {}).items()}
         with self.db:
             positions = repeat(None)
             if first:
@@ -95,7 +97,7 @@ class Store:
                 smallest = self.db.execute("SELECT MIN(queue_position) FROM jobs").fetchone()[0]
                 end = min(0, smallest or 0)
                 positions = range(end - len(entries), end)
-            rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), encoded, position)
+            rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), per_entry.get(entry.id, encoded), position)
                     for entry, position in zip(entries, positions))
             if only_new:
                 return self.db.executemany("""

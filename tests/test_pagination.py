@@ -14,7 +14,7 @@ from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, Options, detect_episode_numbers, output_stem, parse_source
 from yt_downloader.ui import MediaDetailsDialog, PreviewOptionsDialog, Window
 from yt_downloader.updates import EngineManager, Runtime
-from yt_downloader.worker import inspect_media, load_engine, scan
+from yt_downloader.worker import format_expression, inspect_media, load_engine, scan
 
 
 PLAYLIST = "https://www.youtube.com/playlist?list=PLTest"
@@ -117,6 +117,22 @@ class PaginationWorkerTests(unittest.TestCase):
 
 
 class PaginationEngineTests(unittest.TestCase):
+    def test_verified_engine_respects_an_exact_audio_language(self):
+        engine = EngineManager(Path(__file__).resolve().parents[1] / "vendor" / "seed")
+        engine.refresh()
+        if not engine.snapshot().engine:
+            self.skipTest("The Windows build prepares the verified engine.")
+        with (patch.object(sys, "path", sys.path.copy()), patch.object(sys, "dont_write_bytecode")):
+            ydl = load_engine(engine.snapshot().engine)
+            with ydl({"quiet": True, "plugin_dirs": []}) as client:
+                formats = [{"format_id": code, "language": code, "acodec": "opus", "vcodec": "none"}
+                           for code in ("en-US", "en", "pl")]
+                context = {"formats": formats, "incomplete_formats": True}
+                options = Options(audio_only=True, audio_language="en-US", audio_language_exact=True)
+                selector = client.build_format_selector(format_expression(options))
+                self.assertEqual([fmt["format_id"] for fmt in selector(context)], ["en-US"])
+                self.assertEqual(list(selector({**context, "formats": formats[1:]})), [])
+
     def test_verified_engine_retries_errors_and_rejects_an_incomplete_page(self):
         root = Path(__file__).resolve().parents[1] / "vendor" / "seed"
         engine = EngineManager(root)
@@ -265,7 +281,7 @@ class PaginationPreviewTests(unittest.TestCase):
         self.window.tabs.setCurrentWidget(self.window.queue_tab)
         selection = self.window.queue_table.selectionModel()
         for row in (0, 1):
-            selection.select(self.window.queue_model.index(row, 0), QItemSelectionModel.SelectionFlag.Select |
+            selection.select(self.window.queue_filter.index(row, 0), QItemSelectionModel.SelectionFlag.Select |
                              QItemSelectionModel.SelectionFlag.Rows)
 
         def edit(dialog):
@@ -290,10 +306,16 @@ class PaginationPreviewTests(unittest.TestCase):
 
         def inspect(dialog):
             self.worker.events.return_value = [{"kind": "done", "video": [[1080, 60, "vp9", "webm"]],
-                                                "audio": [], "subtitles": [["en", "English", True]]}]
+                                                "audio": [["pl", "opus", 128, "webm"]],
+                                                "subtitles": [["en", "English", False], ["en", "English", True]]}]
             self.controller.poll_media_inspection()
             self.assertEqual(dialog.models[0].rows[0][:2], ("1080p", "60"))
-            self.assertEqual(dialog.models[2].rows[0], ("en", "English", "Automatyczne"))
+            self.assertEqual(dialog.models[2].rows[1], ("en", "English", "Automatyczne"))
+            dialog.resolution.setCurrentIndex(1)
+            dialog.language.setCurrentIndex(1)
+            dialog.captions.setCurrentIndex(3)
+            dialog.apply.click()
+            return dialog.result()
 
         with (patch.object(MediaDetailsDialog, "exec", inspect),
               patch("yt_downloader.controller.Worker", return_value=self.worker) as worker):
@@ -301,6 +323,49 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertEqual(worker.call_args.args[1]["entry"]["id"], entry(2).id)
         self.assertEqual(self.window.preview_model.rowCount(), 3)
         self.assertIsNone(self.controller.media_worker)
+        self.window.add_first.click()
+        first, customized, third = self.controller.store.jobs()
+        self.assertEqual([job.entry.id for job in (first, customized, third)], [entry(i).id for i in range(1, 4)])
+        self.assertEqual(customized.options.audio_language, "pl")
+        self.assertTrue(customized.options.audio_language_exact and customized.options.auto_subtitles_only)
+        self.assertEqual(customized.options.subtitle_languages, "en")
+        self.assertEqual(first.options, third.options)
+        self.assertFalse(first.options.subtitles)
+
+    def test_queue_search_and_status_filter_keep_actions_on_the_visible_job(self):
+        store = self.controller.store
+        store.enqueue([entry(i) for i in range(1, 25)], self.controller.prefs.options)
+        store.state(2, "failed")
+        store.state(20, "failed")
+        self.window.tabs.setCurrentWidget(self.window.queue_tab)
+        self.window.queue_search.setText(" FILM 2 ")
+        self.window.queue_status.setCurrentIndex(self.window.queue_status.findData("failed"))
+        self.assertEqual(self.window.queue_filter.rowCount(), 2)
+        self.window.queue_table.selectRow(1)
+        self.assertEqual([job.id for job in self.window.selected_jobs()], [20])
+        self.window.retry_selected.click()
+        self.assertEqual(self.window.queue_filter.rowCount(), 1)
+        self.assertEqual(self.window.queue_filter.index(0, 0).data(), "Film 2")
+        self.assertEqual([job.id for job in store.jobs() if job.state == "failed"], [2])
+
+    def test_download_profile_persists_and_applies_without_changing_default_options(self):
+        self.send_page(1, 4, {"kind": "done"})
+        original = self.controller.prefs.options
+        profile = replace(original, folder=str(self.controller.root / "Podcast"), audio_only=True,
+                          audio_format="opus", bitrate=96)
+        self.window.preview_options = profile
+        self.window.preview_mode.setCurrentIndex(self.window.preview_mode.findData(True))
+        with patch("yt_downloader.ui.QInputDialog.getText", return_value=("  Podcast  ", True)):
+            self.window.save_download_profile()
+        self.assertEqual(self.window.active_profile, "Podcast")
+        other_window = Window(self.app, self.controller)
+        self.addCleanup(other_window.deleteLater)
+        other_window.build_profiles_menu()
+        next(action for action in other_window.profiles_menu.actions() if action.text() == "Podcast").trigger()
+        self.assertEqual(other_window.options_for_preview(), profile)
+        self.window.add_button.click()
+        self.assertTrue(all(job.options == profile for job in self.controller.store.jobs()))
+        self.assertEqual(self.controller.prefs.options, original)
 
     def test_music_preview_defaults_to_audio_without_changing_global_settings(self):
         self.controller.cancel_scan()
