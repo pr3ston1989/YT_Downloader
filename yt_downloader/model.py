@@ -148,6 +148,24 @@ def detect_episode_numbers(entries):
     return {}
 
 
+def episode_order(numbers, count):
+    if not numbers:
+        return {}, {}
+    rows = sorted(range(count), key=lambda row: (row not in numbers, numbers.get(row, (0, 0))))
+    positions = {row: position for position, row in enumerate(rows, 1)}
+    labels = {}
+    width = max(2, len(str(max(number for _, number in numbers.values()))))
+    unnumbered = 0
+    for row in rows:
+        if row in numbers:
+            season, number = numbers[row]
+            labels[row] = f"S{season:02d}E{number:0{width}d}" if season else f"{number:0{width}d}"
+        else:
+            unnumbered += 1
+            labels[row] = f"Bez numeru {unnumbered:0{width}d}"
+    return positions, labels
+
+
 @dataclass
 class Options:
     folder: str = field(default_factory=lambda: str(Path.home() / "Videos" / "YT Downloader"))

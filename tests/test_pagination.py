@@ -323,6 +323,20 @@ class PaginationPreviewTests(unittest.TestCase):
         self.controller.pause_package(b, True)
         self.assertIn("Film 1", self.window.next_download.text())
 
+    def test_collector_applies_episode_numbers_when_adding_without_opening_the_preview(self):
+        self.send_page(1, 1, {"kind": "done"})
+        collector = self.window.collector_tab
+        collector.input.setPlainText(PLAYLIST)
+        collector.read.click()
+        entries = [replace(entry(i), title=f"Historia odc. {number}") for i, number in enumerate((451, 450), 1)]
+        self.worker.poll.return_value = 0
+        self.worker.events.return_value = [{"kind": "entry", "entry": asdict(item)} for item in entries] + [{"kind": "done"}]
+        self.controller.poll_scan()
+        collector.table.selectAll()
+        collector.add.click()
+        jobs = self.controller.store.jobs()
+        self.assertEqual([job.entry.index_label for job in jobs], ["450", "451"])
+
     def test_relinking_missing_history_updates_the_job_and_redownload_preserves_its_profile(self):
         store = self.controller.store
         options = replace(self.controller.prefs.options, audio_only=True)

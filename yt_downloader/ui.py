@@ -32,7 +32,7 @@ from .collector import LinkCollector
 from .controller import Controller, LABELS
 from .model import (
     APP_DIR, CHANNEL_TABS, EDITABLE_STATES, LANGUAGE_CODE, Entry, Options, TERMINAL, WAITING_STATES,
-    detect_episode_numbers, parse_source,
+    detect_episode_numbers, episode_order, parse_source,
 )
 from .runtime import RESOURCES, atomic_bytes, command
 from .organize import apply_plan, make_plan, plan_selected, plan_undo
@@ -194,21 +194,11 @@ class PreviewModel(TableModel):
                 return value is None, direction * (value or 0)
 
             rows = sorted(rows, key=date_key)
-        elif order == "episode" and self.episode_numbers:
-            rows = sorted(rows, key=lambda row: (row not in self.episode_numbers,
-                                                  self.episode_numbers.get(row, (0, 0))))
-        self.positions = {row: position for position, row in enumerate(rows, 1)} if order != "source" else {}
-        self.number_labels = {}
-        if order == "episode" and self.episode_numbers:
-            width = max(2, len(str(max(number for _, number in self.episode_numbers.values()))))
-            unnumbered = 0
-            for row in self.positions:
-                if row in self.episode_numbers:
-                    season, number = self.episode_numbers[row]
-                    self.number_labels[row] = f"S{season:02d}E{number:0{width}d}" if season else f"{number:0{width}d}"
-                else:
-                    unnumbered += 1
-                    self.number_labels[row] = f"Bez numeru {unnumbered:0{width}d}"
+        if order == "episode":
+            self.positions, self.number_labels = episode_order(self.episode_numbers, len(self.entries))
+        else:
+            self.positions = {row: position for position, row in enumerate(rows, 1)} if order != "source" else {}
+            self.number_labels = {}
         if self.rows:
             self.dataChanged.emit(self.index(0, 1), self.index(len(self.rows) - 1, 1), [DISPLAY, USER])
 

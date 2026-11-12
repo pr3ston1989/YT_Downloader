@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .model import CHANNEL_TABS, Source, parse_source
+from .model import CHANNEL_TABS, Source, detect_episode_numbers, episode_order, parse_source
 
 
 def parse_links(text):
@@ -257,7 +257,12 @@ class LinkCollector(QWidget):
             batch.append((index, item, options, name))
         total = 0
         for index, item, options, name in batch:
-            count, _ = self.c.store.enqueue_batch(item.entries, options, package_name=name, omit_queued_duplicates=True)
+            entries = item.entries
+            positions, labels = episode_order(detect_episode_numbers(entries), len(entries))
+            if positions:
+                entries = [replace(entries[row], index=position, index_label=labels[row])
+                           for row, position in positions.items()]
+            count, _ = self.c.store.enqueue_batch(entries, options, package_name=name, omit_queued_duplicates=True)
             item.status = f"Dodano: {count} · Powtórzenia: {len(item.entries) - count}"
             self.show_item(index)
             total += count
