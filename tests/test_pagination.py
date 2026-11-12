@@ -286,6 +286,65 @@ class PaginationPreviewTests(unittest.TestCase):
         self.window.move_down.click()
         self.assertEqual([job.id for job in store.jobs()], [1, 4, 2, 3])
 
+    def test_preview_packages_can_be_collapsed_paused_and_reordered(self):
+        store = self.controller.store
+        self.send_page(1, 4, {"kind": "done"})
+        self.window.add_button.click()
+        playlist = next(iter(store.packages().values()))
+        self.assertEqual(playlist.name, "Playlista")
+        _, channel = store.enqueue_batch([entry(4), entry(5)], self.controller.prefs.options, package_name="Kanał")
+        self.window.tabs.setCurrentWidget(self.window.queue_tab)
+        self.window.queue_table.selectRow(0)
+        self.window.toggle_package_at(self.window.queue_filter.index(0, 0))
+        self.assertEqual(store.get("collapsed_packages"), [playlist.id])
+        self.assertEqual(self.window.queue_filter.rowCount(), 4)
+        self.assertEqual(self.window.selected_package().id, playlist.id)
+        self.window.pause_selected.click()
+        self.assertTrue(store.packages()[playlist.id].paused)
+        self.window.move_last.click()
+        self.assertEqual([job.package_id for job in store.jobs()], [channel, channel] + [playlist.id] * 3)
+        self.window.queue_search.setText("film 2")
+        self.assertEqual(self.window.queue_filter.rowCount(), 1)
+        self.window.queue_table.selectRow(0)
+        self.window.resume_selected.click()
+        self.assertFalse(store.packages()[playlist.id].paused)
+        self.window.toggle_package_at(self.window.queue_filter.index(0, 0))
+        self.assertEqual(self.window.queue_filter.rowCount(), 2)
+
+    def test_history_file_menu_reveals_and_moves_multiple_selected_downloads(self):
+        store = self.controller.store
+        source = self.controller.root.resolve() / "Oryginalne pliki"
+        target = self.controller.root.resolve() / "Nowe pliki"
+        source.mkdir()
+        target.mkdir()
+        files = [source / "Pierwszy film.mkv", source / "Drugi film.mkv"]
+        store.enqueue([entry(1), entry(2)], self.controller.prefs.options)
+        for path in files:
+            path.write_bytes(b"film")
+            store.complete(store.claim(), str(path))
+        self.window.tabs.setCurrentWidget(self.window.history_tab)
+        view = self.window.history_table
+        view.selectRow(0)
+        self.assertTrue(self.window.show_history_file.isEnabled())
+        with patch("yt_downloader.ui.subprocess.Popen") as explorer:
+            self.window.show_history_file.click()
+        selected_path = self.window.history_selection()[0][2]
+        self.assertIn(f'/select,"{selected_path}"', explorer.call_args.args[0])
+        view.selectAll()
+        self.window.refresh()
+        self.assertEqual(len(self.window.history_selection()), 2)
+        records = self.window.history_selection()
+        with patch("yt_downloader.ui.QFileDialog.getExistingDirectory", return_value=str(target)):
+            with patch.object(OrganizeDialog, "exec", return_value=QDialog.DialogCode.Rejected):
+                self.window.move_selected_downloads(records)
+            self.assertTrue(all(path.is_file() for path in files))
+            with patch.object(OrganizeDialog, "exec", return_value=QDialog.DialogCode.Accepted):
+                self.window.move_selected_downloads(records)
+        self.assertEqual(self.controller.file_move.result(timeout=5), (2, 0, 0))
+        self.controller.poll_file_move()
+        self.assertEqual({Path(path).parent for _, _, path in self.window.history_selection()}, {target})
+        self.assertTrue(all((target / path.name).is_file() for path in files))
+
     def test_batch_edit_and_selected_retry_keep_individual_options_and_queue_positions(self):
         store = self.controller.store
         base = self.controller.prefs.options

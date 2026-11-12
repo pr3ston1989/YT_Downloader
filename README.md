@@ -35,9 +35,13 @@ Kolejkę lub wybrane zadania możesz wstrzymać. Po ponownym uruchomieniu zadani
 
 W karcie **Kolejka** możesz przenieść zaznaczone oczekujące zadania **Na początek**, **Wyżej**, **Niżej** albo **Na koniec**. Przycisk **Pobierz następne** w podglądzie dodaje zaznaczone widoczne pozycje od razu na początek kolejki. Zadania ruszą, gdy zwolni się miejsce na pobranie. Jeśli kolejka jest wstrzymana, wznów ją. Aplikacja zachowuje kolejność po ponownym uruchomieniu.
 
+Podgląd playlisty, kanału lub albumu domyślnie tworzy osobny pakiet w kolejce. W menu **Pakiet** możesz wskazać istniejący pakiet, wpisać własną nazwę lub dodać pozycje luzem. Kliknij nagłówek pakietu dwukrotnie, aby go zwinąć lub rozwinąć. Nagłówek pokazuje postęp i liczbę błędów. Z jego menu możesz wstrzymać cały pakiet, zmienić kolejność jego oczekujących zadań, ustawić im folder albo zastosować zapisany profil. Pauza i zwinięcie pakietu są zapisywane po zamknięciu aplikacji.
+
 Kolejkę można filtrować jednocześnie po fragmencie tytułu i stanie zadania. Akcje na zaznaczonych wierszach obejmują pozycje widoczne po filtrowaniu. Zmiana pozycji zadania dotyczy całej kolejki.
 
 **Usuń z kolejki** usuwa zaznaczone zadania z listy i zatrzymuje aktywne pobrania. Pliki i historia pobrań zostają na dysku. **Parametry…** zmienia ustawienia wybranych zadań przed ich uruchomieniem lub ponowieniem. Przy wielu zadaniach zapis obejmuje pola zmienione w oknie. **Ponów wybrane** ponawia tylko zaznaczone nieudane zadania.
+
+Kliknij gotowe pobranie prawym przyciskiem w kolejce lub historii, aby wybrać **Pokaż w Eksploratorze** lub **Przenieś do folderu…**. Zaznacz kilka pozycji, aby przenieść je razem. Przed zatwierdzeniem zobaczysz pliki towarzyszące i konflikty nazw. Po przeniesieniu aplikacja aktualizuje ścieżki w kolejce i historii.
 
 W podglądzie kliknij wiersz filmu i wybierz **Formaty i napisy…**. Aplikacja odczyta dostępne rozdzielczości, kodeki i języki audio oraz rozróżni napisy ręczne i automatyczne. Wybierz limit rozdzielczości, język audio lub napisy i kliknij **Zastosuj do tego filmu**. Indywidualne wybory są zapisywane w zadaniu przy dodawaniu do kolejki i mają pierwszeństwo przed parametrami podglądu. Wybrany tu język audio jest wymagany. Opcja **Z parametrów podglądu** pozwala ponownie korzystać z ustawień wspólnych dla danej grupy.
 

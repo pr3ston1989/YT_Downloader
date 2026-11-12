@@ -2,9 +2,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import shutil
 from sqlite3 import Error as DatabaseError
+from uuid import uuid4
 
 from .model import safe_segment
 
@@ -68,11 +71,54 @@ def make_plan(root, entries, history):
                 continue
             plan.append(FileGroup(video_id, items[video_id], paths, target, signatures,
                                   "Już w folderze" if directory == target else ""))
+    return flag_conflicts(plan, target)
+
+
+def flag_conflicts(plan, target):
     names = Counter(path.name.casefold() for group in plan if not group.status for path in group.files)
     existing = {path.name.casefold() for path in target.iterdir()} if target.is_dir() else set()
     return [replace(group, status="Konflikt nazw") if not group.status and any(
         path.name.casefold() in existing or names[path.name.casefold()] > 1 for path in group.files
     ) else group for group in plan]
+
+
+def plan_selected(records, target):
+    target = target.resolve(strict=True)
+    if not target.is_dir():
+        raise ValueError("Wybierz folder docelowy.")
+    directories = {}
+    groups = []
+    seen = set()
+    for video_id, title, filename in records:
+        if not filename:
+            continue
+        path = Path(filename)
+        if path in seen:
+            continue
+        seen.add(path)
+        status = ""
+        files = (path,)
+        signatures = ()
+        try:
+            if not path.is_absolute() or not safe_parent(path, path.parent) or not path.is_file() or path.is_symlink():
+                raise OSError("Invalid recorded path")
+            if path.parent not in directories:
+                directories[path.parent] = defaultdict(list)
+                for companion in path.parent.iterdir():
+                    stem, _, suffix = companion.name.rpartition(".")
+                    if suffix.lower() in {"json", "srt", "vtt", "ass"}:
+                        directories[path.parent][stem.rpartition(".")[0]].append(companion)
+                    directories[path.parent][stem].append(companion)
+            files += tuple(companion for companion in directories[path.parent][path.stem]
+                           if SIDECAR.fullmatch(companion.name[len(path.stem) + 1:])
+                           and companion.is_file() and not companion.is_symlink())
+            signatures = tuple(tuple(signature(file)) for file in files)
+            if path.parent == target:
+                status = "Już w folderze"
+        except OSError:
+            status = "Plik niedostępny"
+        groups.append(FileGroup(video_id, title, files, target, signatures, status))
+    return flag_conflicts(groups, target)
 
 
 def signature(path):
@@ -125,10 +171,89 @@ def settle_move(store, move):
     return all(found == dst for (_, dst, _), found in zip(files, locations))
 
 
+def has_signature(path, expected):
+    return path.is_file() and not path.is_symlink() and signature(path) == expected
+
+
+def settle_selected(store, move, transfer):
+    source_dir = Path(move["root"])
+    stage = Path(transfer["stage"])
+    target_dir = stage.parent
+    files = [(Path(src), Path(dst), original, staged) for src, dst, original, staged in transfer["files"]]
+    if (stage.is_symlink() or stage.is_junction() or not stage.name.startswith(".yt-downloader-move-") or
+            not all(safe_parent(src, source_dir) and safe_parent(dst, target_dir) and dst.parent == target_dir
+                    for src, dst, _, _ in files)):
+        raise OSError("A transfer directory has changed")
+    committed = transfer["phase"] == "commit"
+    if committed and any(not has_signature(dst, staged) for _, dst, _, staged in files):
+        raise OSError("A published file has changed")
+    moved = []
+    for src, dst, original, staged in files:
+        staged_path = stage / dst.name
+        if committed:
+            if has_signature(src, original):
+                src.unlink()
+            if src == files[0][0]:
+                moved.append((str(src), str(dst)))
+        elif staged and not staged_path.exists() and has_signature(dst, staged):
+            dst.unlink()
+        staged_path.unlink(missing_ok=True)
+    if stage.exists():
+        stage.rmdir()
+    store.finish_file_move(move["id"], move["video_id"], move["title"], moved)
+
+
+def stage_file(source, staged):
+    try:
+        os.link(source, staged)
+    except OSError:
+        # FAT/exFAT, network shares and other volumes require a copy.
+        with source.open("rb") as reader, staged.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        shutil.copystat(source, staged)
+
+
+def move_selected_group(store, group):
+    source_dir = group.files[0].parent
+    stage = group.target / f".yt-downloader-move-{uuid4().hex}"
+    files = [[str(src), str(group.target / src.name), list(expected), None]
+             for src, expected in zip(group.files, group.signatures, strict=True)]
+    for src, dst, expected, _ in files:
+        src, dst = Path(src), Path(dst)
+        if (not safe_parent(src, source_dir) or not safe_parent(dst, group.target) or
+                not has_signature(src, expected) or dst.exists() or dst.is_symlink()):
+            raise OSError("The source or destination changed since the preview")
+    transfer = {"phase": "stage", "stage": str(stage), "files": files}
+    move_id = store.record_file_move(source_dir, group.video_id, group.title, transfer)
+    move = {"id": move_id, "root": str(source_dir), "video_id": group.video_id, "title": group.title}
+    stage.mkdir()
+    try:
+        for file in files:
+            src, dst, expected, _ = file
+            staged = stage / Path(dst).name
+            stage_file(Path(src), staged)
+            file[3] = signature(staged)
+            if file[3][2] != expected[2] or not has_signature(Path(src), expected):
+                raise OSError(f"The source file changed during transfer: {src}")
+        store.update_file_move(move_id, transfer)
+        for _, dst, _, _ in files:
+            rename_file(stage / Path(dst).name, Path(dst))
+        store.update_file_move(move_id, {**transfer, "phase": "commit"})
+        transfer["phase"] = "commit"
+    finally:
+        settle_selected(store, move, transfer)
+
+
 def recover_file_moves(store):
     for move in store.pending_file_moves():
         try:
-            settle_move(store, move)
+            files = json.loads(move["files"])
+            if isinstance(files, dict):
+                settle_selected(store, move, files)
+            else:
+                settle_move(store, move)
         except (OSError, DatabaseError):
             LOG.exception("Sprawdzanie przerwanego przenoszenia plików")
 
@@ -142,6 +267,10 @@ def apply_plan(store, root, groups, active_ids):
             busy += len(group.files)
             continue
         try:
+            if root is None:
+                move_selected_group(store, group)
+                moved += len(group.files)
+                continue
             files = [(path, group.target / path.name) for path in group.files]
             if not all(safe_parent(src, root) and safe_parent(dst, root) and src.is_file() and not src.is_symlink()
                        and not dst.exists() and not dst.is_symlink() for src, dst in files):

@@ -19,6 +19,14 @@ class Job:
     auth_attempts: int
     reason: str
     path: str
+    package_id: int | None = None
+
+
+@dataclass(frozen=True)
+class Package:
+    id: int
+    name: str
+    paused: bool
 
 
 class Store:
@@ -28,7 +36,11 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
             PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id TEXT NOT NULL, entry TEXT NOT NULL, options TEXT NOT NULL,
@@ -62,6 +74,9 @@ class Store:
             self.db.execute("ALTER TABLE jobs ADD COLUMN auth_attempts INTEGER NOT NULL DEFAULT 0")
         if "queue_position" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN queue_position INTEGER")
+        if "package_id" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN package_id INTEGER REFERENCES packages(id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS job_package ON jobs (package_id)")
         columns = {column["name"] for column in self.db.execute("PRAGMA table_info(subscriptions)")}
         for name in ("needs_login", "music"):
             if name not in columns:
@@ -88,49 +103,115 @@ class Store:
     def preferences(self):
         return Preferences.from_dict(self.get("settings", {}))
 
-    def enqueue(self, entries, options: Options, *, only_new=False, first=False, overrides=None):
+    def packages(self):
+        return {row["id"]: Package(row["id"], row["name"], bool(row["paused"]))
+                for row in self.db.execute("SELECT * FROM packages ORDER BY id")}
+
+    def pause_package(self, package_id, paused):
+        with self.db:
+            self.db.execute("UPDATE packages SET paused=? WHERE id=?", (paused, package_id))
+
+    def assign_package(self, ids, package_id, *, name=None):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.waiting_rows()
+            selected = set(ids)
+            if name is not None:
+                package_id = self.db.execute("INSERT INTO packages (name) VALUES (?)", (name,)).lastrowid
+            count = self.db.execute("""
+                UPDATE jobs SET package_id=? WHERE state!='running' AND id IN (SELECT value FROM json_each(?))
+            """, (package_id, json.dumps(list(selected)))).rowcount
+            if package_id is not None:
+                selected_waiting = {row["id"] for row in rows if row["id"] in selected and row["package_id"] != package_id}
+                members = [row["id"] for row in rows if row["package_id"] == package_id]
+                self.join_waiting(rows, selected_waiting, members)
+            self.delete_empty_packages()
+            return count
+
+    def enqueue(self, entries, options: Options, *, only_new=False, first=False, overrides=None, package_id=None):
+        count, _ = self.enqueue_batch(entries, options, only_new=only_new, first=first, overrides=overrides,
+                                      package_id=package_id)
+        return count
+
+    def enqueue_batch(self, entries, options: Options, *, only_new=False, first=False, overrides=None,
+                      package_id=None, package_name=None):
         encoded = json.dumps(asdict(options), ensure_ascii=False)
         per_entry = {video_id: json.dumps(asdict(value), ensure_ascii=False)
                      for video_id, value in (overrides or {}).items()}
         with self.db:
             positions = repeat(None)
+            existing = []
+            if first or package_id is not None:
+                self.db.execute("BEGIN IMMEDIATE")
             if first:
                 entries = list(entries)
-                self.db.execute("BEGIN IMMEDIATE")
                 # Normal jobs sort by their positive ID. Reserve earlier positions for this batch.
                 smallest = self.db.execute("SELECT MIN(queue_position) FROM jobs").fetchone()[0]
                 end = min(0, smallest or 0)
                 positions = range(end - len(entries), end)
-            rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), per_entry.get(entry.id, encoded), position)
+            elif package_id is not None:
+                existing = [row["id"] for row in self.waiting_rows() if row["package_id"] == package_id]
+            if existing:
+                previous_id = self.db.execute("SELECT MAX(id) FROM jobs").fetchone()[0]
+            if package_name is not None:
+                package_id = self.db.execute("INSERT INTO packages (name) VALUES (?)", (package_name,)).lastrowid
+            rows = ((entry.id, json.dumps(asdict(entry), ensure_ascii=False), per_entry.get(entry.id, encoded),
+                     position, package_id)
                     for entry, position in zip(entries, positions))
             if only_new:
-                return self.db.executemany("""
-                    INSERT INTO jobs (video_id,entry,options,queue_position)
-                    SELECT ?1, ?2, ?3, ?4
+                count = self.db.executemany("""
+                    INSERT INTO jobs (video_id,entry,options,queue_position,package_id)
+                    SELECT ?1, ?2, ?3, ?4, ?5
                     WHERE NOT EXISTS (SELECT 1 FROM downloads WHERE id=?1)
                     AND NOT EXISTS (SELECT 1 FROM jobs WHERE video_id=?1 AND state NOT IN ('skipped','failed'))
                 """, rows).rowcount
-            return self.db.executemany(
-                "INSERT INTO jobs (video_id,entry,options,queue_position) VALUES (?,?,?,?)", rows).rowcount
+            else:
+                count = self.db.executemany("""
+                    INSERT INTO jobs (video_id,entry,options,queue_position,package_id) VALUES (?,?,?,?,?)
+                """, rows).rowcount
+            if existing and count:
+                waiting = self.waiting_rows()
+                self.join_waiting(waiting, {row["id"] for row in waiting if row["id"] > previous_id}, existing)
+            if not count and package_name is not None:
+                self.db.execute("DELETE FROM packages WHERE id=?", (package_id,))
+                package_id = None
+            return count, package_id
 
     @staticmethod
     def job(row):
         return Job(row["id"], Entry(**json.loads(row["entry"])), Options(**json.loads(row["options"])),
                    row["state"], row["attempts"], row["recovery"], row["auth_attempts"],
-                   row["reason"], row["path"])
+                   row["reason"], row["path"], row["package_id"])
 
     def jobs(self):
         return [self.job(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY COALESCE(queue_position, id)")]
+
+    def waiting_rows(self):
+        placeholders = ",".join("?" for _ in WAITING_STATES)
+        return self.db.execute(f"""
+                SELECT id, package_id, COALESCE(queue_position, id) AS position FROM jobs
+                WHERE state IN ({placeholders}) ORDER BY position
+        """, WAITING_STATES).fetchall()
+
+    def write_order(self, rows, order):
+        return self.db.executemany("UPDATE jobs SET queue_position=? WHERE id=?",
+                                   ((row["position"], job_id) for row, job_id in zip(rows, order)
+                                    if row["id"] != job_id)).rowcount
+
+    def join_waiting(self, rows, selected, existing):
+        if not selected:
+            return
+        order = [row["id"] for row in rows if row["id"] not in selected]
+        end = (order.index(existing[-1]) + 1 if existing else
+               next(i for i, row in enumerate(rows) if row["id"] in selected))
+        order[end:end] = [row["id"] for row in rows if row["id"] in selected]
+        self.write_order(rows, order)
 
     def move_jobs(self, ids, direction):
         selected = set(ids)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            placeholders = ",".join("?" for _ in WAITING_STATES)
-            rows = self.db.execute(f"""
-                SELECT id, COALESCE(queue_position, id) AS position FROM jobs
-                WHERE state IN ({placeholders}) ORDER BY position
-            """, WAITING_STATES).fetchall()
+            rows = self.waiting_rows()
             order = [row["id"] for row in rows]
             if direction == "first":
                 order.sort(key=lambda job_id: job_id not in selected)
@@ -145,9 +226,34 @@ class Store:
                         order[index], order[neighbor] = order[neighbor], order[index]
             else:
                 raise ValueError(f"Unknown queue move: {direction}")
-            return self.db.executemany("UPDATE jobs SET queue_position=? WHERE id=?",
-                                       ((row["position"], job_id) for row, job_id in zip(rows, order)
-                                        if row["id"] != job_id)).rowcount
+            return self.write_order(rows, order)
+
+    def move_package(self, package_id, direction):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            rows = self.waiting_rows()
+            members = [row["id"] for row in rows if row["package_id"] == package_id]
+            if not members:
+                return 0
+            units = list(dict.fromkeys((row["package_id"], 0 if row["package_id"] else row["id"]) for row in rows))
+            current = units.index((package_id, 0))
+            target = {"first": 0, "up": max(0, current - 1), "down": min(len(units) - 1, current + 1),
+                      "last": len(units) - 1}[direction]
+            if current == target and direction in ("up", "down"):
+                return 0
+            neighbor, loose = units[target]
+            remaining = [row for row in rows if row["package_id"] != package_id]
+            edges = [i for i, row in enumerate(remaining)
+                     if (row["package_id"] == neighbor if neighbor else row["id"] == loose)]
+            if direction == "first":
+                index = 0
+            elif direction == "last":
+                index = len(remaining)
+            else:
+                index = edges[0] if target < current else edges[-1] + 1
+            order = [row["id"] for row in remaining]
+            order[index:index] = members
+            return self.write_order(rows, order)
 
     def skip_downloaded(self, excluded=()):
         with self.db:
@@ -158,16 +264,18 @@ class Store:
                     AND EXISTS (SELECT 1 FROM downloads WHERE id=jobs.video_id)
             """, ("Film jest już w historii.", json.dumps(list(excluded)))).rowcount
 
-    def claim(self, excluded=()):
+    def claim(self, excluded=(), moving=()):
         with self.db:
             row = self.db.execute("""
                 UPDATE jobs SET state='running', reason='' WHERE id=(
                     SELECT j.id FROM jobs j WHERE j.state='queued' AND j.ready<=?
                     AND j.id NOT IN (SELECT value FROM json_each(?))
+                    AND j.video_id NOT IN (SELECT value FROM json_each(?))
+                    AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.id=j.package_id AND p.paused)
                     AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.video_id=j.video_id AND r.state='running')
                     ORDER BY COALESCE(j.queue_position, j.id) LIMIT 1
                 ) RETURNING *
-            """, (time.time(), json.dumps(list(excluded)))).fetchone()
+            """, (time.time(), json.dumps(list(excluded)), json.dumps(list(moving)))).fetchone()
             return self.job(row) if row else None
 
     def state(self, job_id, state, reason="", *, delay=0, attempts=None, recovery=None):
@@ -219,11 +327,17 @@ class Store:
     def clear_jobs(self):
         with self.db:
             self.db.execute("DELETE FROM jobs WHERE state IN ('done','skipped','failed')")
+            self.delete_empty_packages()
 
     def remove_jobs(self, ids):
         with self.db:
-            return self.db.execute("DELETE FROM jobs WHERE id IN (SELECT value FROM json_each(?))",
-                                   (json.dumps(list(ids)),)).rowcount
+            count = self.db.execute("DELETE FROM jobs WHERE id IN (SELECT value FROM json_each(?))",
+                                    (json.dumps(list(ids)),)).rowcount
+            self.delete_empty_packages()
+            return count
+
+    def delete_empty_packages(self):
+        self.db.execute("DELETE FROM packages WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE package_id=packages.id)")
 
     def history(self):
         return self.db.execute("SELECT * FROM downloads ORDER BY time DESC").fetchall()
@@ -235,6 +349,10 @@ class Store:
 
     def pending_file_moves(self):
         return self.db.execute("SELECT * FROM file_moves ORDER BY id").fetchall()
+
+    def update_file_move(self, move_id, files):
+        with self.db:
+            self.db.execute("UPDATE file_moves SET files=? WHERE id=?", (json.dumps(files), move_id))
 
     def finish_file_move(self, move_id, video_id, title, paths):
         with self.db:

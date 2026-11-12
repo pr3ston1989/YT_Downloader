@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime
 import json
@@ -14,7 +14,7 @@ from PySide6.QtCore import (
     QAbstractTableModel, QItemSelection, QItemSelectionModel, QLockFile, QModelIndex, QSortFilterProxyModel,
     Qt, QTimer, QUrl,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -31,8 +31,9 @@ from .model import (
     detect_episode_numbers, parse_source,
 )
 from .runtime import RESOURCES, atomic_bytes, command
-from .organize import apply_plan, make_plan
+from .organize import apply_plan, make_plan, plan_selected
 from .updates.application import restart_for
+from .store import Job, Package
 
 
 LOG = logging.getLogger(__name__)
@@ -232,16 +233,65 @@ class QueueModel(TableModel):
     def __init__(self):
         super().__init__(("Tytuł", "Stan", "Postęp", "Prędkość", "ETA", "Informacja"))
         self.jobs = []
+        self.by_id = {}
         self.positions = {}
         self.events = {}
+        self.items = []
+        self.collapsed = set()
+        self.package_jobs = defaultdict(list)
+        self.package_rows = defaultdict(list)
+        self.package_row_jobs = {}
+        self.package_counts = {}
+        self.package_progress = Counter()
 
-    def update_jobs(self, jobs):
-        same_ids = len(jobs) == len(self.jobs) and all(a.id == b.id for a, b in zip(jobs, self.jobs))
+    def update_jobs(self, jobs, packages=None):
+        packages = packages or {}
         self.jobs = jobs
-        self.positions = {job.id: i for i, job in enumerate(jobs)}
+        self.by_id = {job.id: job for job in jobs}
         self.events = {job.id: self.events[job.id] for job in jobs
                        if job.state == "running" and job.id in self.events}
-        rows = [self.cells(job) for job in jobs]
+        self.positions = {}
+        self.package_jobs = defaultdict(list)
+        self.package_rows = defaultdict(list)
+        self.package_row_jobs = {}
+        self.collapsed.intersection_update(packages)
+        for job in jobs:
+            if job.package_id in packages:
+                self.package_jobs[job.package_id].append(job)
+        self.package_counts = {key: Counter(job.state for job in members)
+                               for key, members in self.package_jobs.items()}
+        self.package_progress = Counter({key: sum(self.job_progress(job) for job in members)
+                                         for key, members in self.package_jobs.items()})
+        finished = {key: [job for job in members if job.state in TERMINAL]
+                    for key, members in self.package_jobs.items() if any(job.state not in TERMINAL for job in members)}
+        last_pending = {job.package_id: job.id for job in jobs if job.state not in TERMINAL}
+        items = []
+        previous = None
+        members_at_header = None
+        for job in jobs:
+            if job.package_id in finished and job.state in TERMINAL:
+                continue
+            package = packages.get(job.package_id)
+            hidden = job.package_id in self.collapsed
+            if job.package_id != previous:
+                members_at_header = None
+                if package and not (hidden and self.package_rows[package.id]):
+                    self.package_rows[package.id].append(len(items))
+                    members_at_header = self.package_jobs[package.id] if hidden else []
+                    self.package_row_jobs[len(items)] = members_at_header
+                    items.append(package)
+            if not hidden:
+                members = finished.get(job.package_id, ()) if last_pending.get(job.package_id) == job.id else ()
+                for item in (job, *members):
+                    self.positions[item.id] = len(items)
+                    items.append(item)
+                    if members_at_header is not None:
+                        members_at_header.append(item)
+            previous = job.package_id
+        same_ids = len(items) == len(self.items) and all(type(a) is type(b) and a.id == b.id
+                                                        for a, b in zip(items, self.items))
+        self.items = items
+        rows = [self.package_cells(item) if isinstance(item, Package) else self.cells(item) for item in items]
         if same_ids:
             self.rows = rows
             if rows:
@@ -250,25 +300,52 @@ class QueueModel(TableModel):
             self.replace(rows)
         return not same_ids
 
+    def job_progress(self, job):
+        return 100 if job.state in ("done", "skipped") else int(self.events.get(job.id, {}).get("percent", 0))
+
+    def package_cells(self, package):
+        counts = self.package_counts[package.id]
+        total = sum(counts.values())
+        arrow = "▸" if package.id in self.collapsed else "▾"
+        state = "Wstrzymano pakiet" if package.paused else ("Zakończono" if total == sum(
+            counts[state] for state in TERMINAL) else "Pakiet")
+        details = f"Gotowe {counts['done']}/{total} · Pominięte {counts['skipped']} · Błędy {counts['failed']}"
+        return f"{arrow} {package.name}", state, self.package_progress[package.id] // total, "", "", details
+
     def cells(self, job):
         event = self.events.get(job.id, {})
-        progress = 100 if job.state in ("done", "skipped") else event.get("percent", 0)
+        progress = self.job_progress(job)
         speed = event.get("speed")
         status = "Przetwarzanie" if event.get("kind") == "processing" else LABELS[job.state]
-        return job.entry.title, status, int(progress), (f"{speed / 1048576:.1f} MB/s" if speed else "—"), \
+        title = f"    {job.entry.title}" if job.package_id is not None else job.entry.title
+        return title, status, progress, (f"{speed / 1048576:.1f} MB/s" if speed else "—"), \
             duration(event.get("eta")), job.reason or job.path
 
     def update_progress(self, job_id, event):
-        if job_id not in self.positions:
+        job = self.by_id.get(job_id)
+        if job is None:
             return
-        position = self.positions[job_id]
+        previous = self.job_progress(job)
         self.events[job_id] = {**self.events.get(job_id, {}), **event}
-        self.rows[position] = self.cells(self.jobs[position])
-        self.dataChanged.emit(self.index(position, 1), self.index(position, 4))
+        if job_id in self.positions:
+            position = self.positions[job_id]
+            self.rows[position] = self.cells(job)
+            self.dataChanged.emit(self.index(position, 1), self.index(position, 4))
+        if job.package_id in self.package_rows:
+            self.package_progress[job.package_id] += self.job_progress(job) - previous
+            for position in self.package_rows[job.package_id]:
+                self.rows[position] = self.package_cells(self.items[position])
+                index = self.index(position, 2)
+                self.dataChanged.emit(index, index, [USER])
 
     def data(self, index, role=DISPLAY):
-        if index.isValid() and index.column() == 2 and role == USER:
-            return self.rows[index.row()][2]
+        if index.isValid():
+            if index.column() == 2 and role == USER:
+                return self.rows[index.row()][2]
+            if role == Qt.ItemDataRole.FontRole and isinstance(self.items[index.row()], Package):
+                font = QFont()
+                font.setBold(True)
+                return font
         return super().data(index, role)
 
 
@@ -286,10 +363,17 @@ class QueueFilter(QSortFilterProxyModel):
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, source_row, source_parent):
-        jobs = self.sourceModel().jobs
-        if source_row >= len(jobs):
+        model = self.sourceModel()
+        if source_row >= len(model.items):
             return False
-        job = jobs[source_row]
+        item = model.items[source_row]
+        if isinstance(item, Package):
+            if not self.title and self.state is None:
+                return True
+            return any(self.matches(job) for job in model.package_row_jobs[source_row])
+        return self.matches(item)
+
+    def matches(self, job):
         return (self.state is None or job.state == self.state) and self.title in job.entry.title.casefold()
 
 
@@ -566,10 +650,11 @@ class MediaDetailsDialog(QDialog):
 class OrganizeDialog(QDialog):
     def __init__(self, root, groups, parent):
         super().__init__(parent)
-        self.setWindowTitle("Plan uporządkowania plików")
+        self.setWindowTitle("Plan przeniesienia plików")
         self.resize(850, 460)
         paths = TableModel(("Obecna ścieżka", "Ścieżka po przeniesieniu", "Stan"))
-        paths.replace([(str(path.relative_to(root)), str((group.target / path.name).relative_to(root)),
+        paths.replace([(str(path.relative_to(root) if root else path),
+                        str((group.target / path.name).relative_to(root) if root else group.target / path.name),
                         group.status or "Do przeniesienia") for group in groups for path in group.files])
         view = table(paths, 0)
         view.setColumnWidth(1, 300)
@@ -599,6 +684,8 @@ class Window(QMainWindow):
         self.active_profile = None
         self.preview_music = False
         self.preview_source = None
+        self.preview_package = "auto"
+        self.auto_package = None
         self.login_url = ""
         self.quitting = False
         self.setWindowTitle(APP_NAME)
@@ -713,6 +800,10 @@ class Window(QMainWindow):
         self.preview_mode = combo([("Tryb z ustawień", None), ("Tylko audio", True), ("Wideo", False)], None)
         self.preview_mode.setToolTip("Tryb pobierania pozycji dodawanych z tego podglądu.")
         self.preview_parameters = button("Parametry pobierania…", self.edit_preview_options)
+        self.package_button = QPushButton("Pakiet…")
+        self.package_menu = QMenu(self.package_button)
+        self.package_menu.aboutToShow.connect(self.build_preview_package_menu)
+        self.package_button.setMenu(self.package_menu)
         self.media_details = button("Formaty i napisy…", self.show_media_details)
         self.preview_parameters.setEnabled(False)
         self.preview_mode.setEnabled(False)
@@ -723,8 +814,9 @@ class Window(QMainWindow):
                          self.media_details)
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
-        layout.addWidget(row(self.preview_info, None, self.select_all_button, self.select_none_button,
-                             self.organize_button, self.add_first, self.add_button))
+        layout.addWidget(self.preview_info)
+        layout.addWidget(row(self.select_all_button, self.select_none_button, self.organize_button, None,
+                             self.package_button, self.add_first, self.add_button))
         layout.addWidget(self.preview_table, 1)
         return page
 
@@ -732,6 +824,7 @@ class Window(QMainWindow):
         page = QWidget()
         queue_layout = QVBoxLayout(page)
         self.queue_model = QueueModel()
+        self.queue_model.collapsed = set(self.c.store.get("collapsed_packages", []))
         self.queue_filter = QueueFilter(self.queue_model, self)
         self.queue_table = table(self.queue_filter, 0)
         self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -741,6 +834,9 @@ class Window(QMainWindow):
         self.queue_table.setColumnWidth(4, 65)
         self.queue_table.setColumnWidth(5, 230)
         self.queue_table.setItemDelegateForColumn(2, ProgressDelegate(self.queue_table))
+        self.queue_table.doubleClicked.connect(self.toggle_package_at)
+        self.queue_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.queue_table.customContextMenuRequested.connect(self.queue_menu)
         self.pause_all = button("Wstrzymaj kolejkę", lambda: self.c.pause_all(not self.c.paused))
         self.pause_selected = button("Wstrzymaj", lambda: self.selected_action("pause"))
         self.resume_selected = button("Wznów", lambda: self.selected_action("resume"))
@@ -819,11 +915,18 @@ class Window(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         self.history = TableModel(("Tytuł / źródło", "ID YouTube", "Data zapisu", "Plik"))
-        view = table(self.history, 0)
+        view = self.history_table = table(self.history, 0)
         view.setColumnWidth(3, 420)
+        view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         view.doubleClicked.connect(self.open_history_folder)
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self.history_menu)
+        self.show_history_file = button("Pokaż w Eksploratorze", lambda: self.reveal_downloads(self.history_selection()))
+        self.show_history_file.setEnabled(False)
+        view.selectionModel().selectionChanged.connect(lambda *_: self.show_history_file.setEnabled(
+            len(self.history_selection()) == 1))
         layout.addWidget(row(button("Importuj archiwum yt-dlp…", self.import_history), None,
-                             button("Wyczyść historię", self.clear_history)))
+                             self.show_history_file, button("Wyczyść historię", self.clear_history)))
         layout.addWidget(view)
         return page
 
@@ -904,6 +1007,8 @@ class Window(QMainWindow):
         self.preview_music = source.music
         self.preview_source = source
         if not preserve_options:
+            self.choose_preview_package("auto")
+            self.auto_package = None
             self.media_choices.clear()
             self.reset_preview_options()
         self.preview_mode.setEnabled(True)
@@ -955,6 +1060,7 @@ class Window(QMainWindow):
         can_add = enabled and any(row in self.preview_model.selected for row in self.visible_rows())
         self.add_button.setEnabled(can_add)
         self.add_first.setEnabled(can_add)
+        self.package_button.setEnabled(enabled)
         playlist = self.preview_source is not None and self.preview_source.kind in ("playlist", "album")
         self.organize_button.setVisible(playlist)
         self.organize_button.setEnabled(playlist and self.preview_model.checkable and bool(self.preview_model.entries))
@@ -987,20 +1093,29 @@ class Window(QMainWindow):
         if not groups:
             self.notify("W wybranym folderze nie znaleziono plików z tej playlisty.")
             return
+        self.confirm_file_move(root, groups)
+
+    def confirm_file_move(self, root, groups):
+        if self.c.file_move is not None:
+            self.notify("Trwa już przenoszenie plików.")
+            return
         active = {item.job.entry.id for item in self.c.active.values()}
         groups = [replace(group, status="Trwa pobieranie") if not group.status and group.video_id in active else group
                   for group in groups]
         dialog = OrganizeDialog(root, groups, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            active = {item.job.entry.id for item in self.c.active.values()}
-            moved, errors, busy = apply_plan(self.c.store, root, groups, active)
-            message = f"Przeniesiono plików: {moved}."
-            if errors:
-                message += f" Grupy z błędem: {errors}. Szczegóły są w logu."
-            if busy:
-                message += f" Pliki pominięte podczas pobierania: {busy}."
-            self.notify(message)
-            self.refresh()
+            if root is None:
+                self.c.move_downloads(root, groups)
+            else:
+                active = {item.job.entry.id for item in self.c.active.values()}
+                moved, errors, busy = apply_plan(self.c.store, root, groups, active)
+                message = f"Przeniesiono plików: {moved}."
+                if errors:
+                    message += f" Grupy z błędem: {errors}. Szczegóły są w logu."
+                if busy:
+                    message += f" Pliki pominięte podczas pobierania: {busy}."
+                self.notify(message)
+                self.refresh()
         dialog.deleteLater()
 
     def show_media_details(self):
@@ -1152,6 +1267,61 @@ class Window(QMainWindow):
                 self.preview_parameters.setText("Zmienione parametry…")
         dialog.deleteLater()
 
+    def build_preview_package_menu(self):
+        self.package_menu.clear()
+        self.package_menu.addAction("Automatycznie", lambda: self.choose_preview_package("auto"))
+        self.package_menu.addAction("Bez pakietu", lambda: self.choose_preview_package(None))
+        self.package_menu.addAction("Nowy pakiet…", self.name_preview_package)
+        packages = self.c.store.packages().values()
+        self.add_package_choices(self.package_menu, packages, self.choose_preview_package)
+
+    def add_package_choices(self, menu, packages, handler):
+        packages = list(packages)
+        if packages:
+            existing = menu.addMenu("Istniejący pakiet")
+            for package in packages:
+                label = package.name + (" (wstrzymany)" if package.paused else "")
+                action = existing.addAction(label.replace("&", "&&"))
+                action.triggered.connect(lambda checked=False, key=package.id: handler(key))
+
+    def package_name(self):
+        name, accepted = QInputDialog.getText(self, "Nowy pakiet", "Nazwa pakietu")
+        return name.strip() if accepted else ""
+
+    def name_preview_package(self):
+        if name := self.package_name():
+            self.choose_preview_package((name,))
+
+    def choose_preview_package(self, choice):
+        self.preview_package = choice
+        packages = self.c.store.packages() if isinstance(choice, int) else {}
+        if choice in packages:
+            label = packages[choice].name
+        elif isinstance(choice, tuple):
+            label = choice[0]
+        else:
+            label = "Automatycznie" if choice == "auto" else "Bez pakietu"
+        self.package_button.setText(f"Pakiet · {label[:24]}…" if len(label) > 24 else f"Pakiet · {label}")
+        self.package_button.setToolTip(label)
+
+    def resolve_preview_package(self, entry):
+        choice = self.preview_package
+        if choice is None:
+            return None, None
+        packages = self.c.store.packages()
+        if isinstance(choice, int):
+            if choice not in packages:
+                raise ValueError("Wybrany pakiet został usunięty. Wybierz inny pakiet.")
+            return choice, None
+        if isinstance(choice, tuple):
+            return None, choice[0]
+        if self.preview_source is None or self.preview_source.kind == "video":
+            return None, None
+        if self.auto_package in packages:
+            return self.auto_package, None
+        name = entry.source_name or entry.playlist or entry.channel or SOURCE_NAMES[self.preview_source.kind]
+        return None, name
+
     def enqueue(self, *, first=False):
         options = self.options_for_preview()
         selected = [index for index in self.visible_rows() if index in self.preview_model.selected]
@@ -1166,22 +1336,54 @@ class Window(QMainWindow):
             self.notify(str(exc))
             return
         if selected:
-            count = self.c.store.enqueue(entries, options, first=first, overrides=overrides)
+            try:
+                package_id, name = self.resolve_preview_package(entries[0])
+            except ValueError as exc:
+                self.notify(str(exc))
+                return
+            count, package_id = self.c.store.enqueue_batch(entries, options, first=first, overrides=overrides,
+                                                          package_id=package_id, package_name=name)
+            if name is not None and package_id is not None:
+                if self.preview_package == "auto":
+                    self.auto_package = package_id
+                else:
+                    self.choose_preview_package(package_id)
             self.c.store.skip_downloaded()
             self.preview_model.select_rows(selected, False)
             message = f"Dodano {count} pozycji na początek kolejki." if first else f"Dodano pozycji: {count}."
             if first and self.c.paused:
                 message += " Kolejka jest wstrzymana."
+            elif first and package_id is not None and self.c.store.packages()[package_id].paused:
+                message += " Pakiet jest wstrzymany."
             self.notify(message)
             self.refresh()
             if first:
                 self.tabs.setCurrentWidget(self.queue_tab)
                 self.queue_table.scrollToTop()
 
+    def queue_item(self, index):
+        source = self.queue_filter.mapToSource(index)
+        return self.queue_model.items[source.row()] if source.isValid() else None
+
+    def selected_queue_items(self):
+        return [self.queue_item(index) for index in self.queue_table.selectionModel().selectedRows()]
+
     def selected_jobs(self):
-        jobs = self.queue_model.jobs
-        return [jobs[source.row()] for index in self.queue_table.selectionModel().selectedRows()
-                if (source := self.queue_filter.mapToSource(index)).isValid() and source.row() < len(jobs)]
+        return [item for item in self.selected_queue_items() if isinstance(item, Job)]
+
+    def selected_package(self):
+        items = self.selected_queue_items()
+        return items[0] if len(items) == 1 and isinstance(items[0], Package) else None
+
+    def toggle_package_at(self, index):
+        package = self.queue_item(index)
+        if isinstance(package, Package):
+            self.toggle_package(package.id)
+
+    def toggle_package(self, package_id):
+        self.queue_model.collapsed.symmetric_difference_update({package_id})
+        self.c.store.set("collapsed_packages", sorted(self.queue_model.collapsed))
+        self.refresh()
 
     def filter_queue(self):
         self.queue_filter.set_filters(self.queue_search.text(), self.queue_status.currentData())
@@ -1190,30 +1392,57 @@ class Window(QMainWindow):
 
     def selection_state(self):
         jobs = self.selected_jobs()
+        package = self.selected_package()
         self.remove_selected.setEnabled(bool(jobs))
         self.edit_selected.setEnabled(any(job.state in EDITABLE_STATES and job.id not in self.c.active for job in jobs))
         self.retry_selected.setEnabled(any(job.state == "failed" for job in jobs))
         self.pause_selected.setEnabled(any(job.state in ("queued", "running", "repair") for job in jobs))
         self.resume_selected.setEnabled(any(job.state == "paused" for job in jobs))
+        self.pause_selected.setText("Wstrzymaj pakiet" if package else "Wstrzymaj")
+        self.resume_selected.setText("Wznów pakiet" if package else "Wznów")
+        if package:
+            members = self.queue_model.package_jobs[package.id]
+            self.pause_selected.setEnabled(not package.paused)
+            self.resume_selected.setEnabled(package.paused)
+            self.edit_selected.setEnabled(any(job.state in EDITABLE_STATES and job.id not in self.c.active
+                                              for job in members))
+            self.retry_selected.setEnabled(any(job.state == "failed" for job in members))
         selected = {job.id for job in jobs}
         waiting = [job.id for job in self.queue_model.jobs if job.state in WAITING_STATES]
         positions = [i for i, job_id in enumerate(waiting) if job_id in selected]
         before = bool(positions) and positions[-1] >= len(positions)
         after = bool(positions) and positions[0] < len(waiting) - len(positions)
-        self.move_first.setEnabled(before)
-        self.move_up.setEnabled(before)
-        self.move_down.setEnabled(after)
-        self.move_last.setEnabled(after)
+        can_move_package = package is not None and any(job.state in WAITING_STATES for job in members)
+        self.move_first.setEnabled(before or can_move_package)
+        self.move_up.setEnabled(before or can_move_package)
+        self.move_down.setEnabled(after or can_move_package)
+        self.move_last.setEnabled(after or can_move_package)
 
     def move_queue(self, direction):
+        if package := self.selected_package():
+            self.move_queue_package(package.id, direction)
+            return
         selected = [job.id for job in self.selected_jobs() if job.state in WAITING_STATES]
         if self.c.store.move_jobs(selected, direction):
             self.refresh()
-            rows = [self.queue_model.positions[job_id] for job_id in selected]
-            edge = min(rows) if direction in ("first", "up") else max(rows)
-            self.queue_table.scrollTo(self.queue_filter.mapFromSource(self.queue_model.index(edge, 0)))
+            rows = [self.queue_model.positions[job_id] for job_id in selected if job_id in self.queue_model.positions]
+            if rows:
+                edge = min(rows) if direction in ("first", "up") else max(rows)
+                self.queue_table.scrollTo(self.queue_filter.mapFromSource(self.queue_model.index(edge, 0)))
+
+    def move_queue_package(self, package_id, direction):
+        if self.c.store.move_package(package_id, direction):
+            self.refresh()
+            position = self.queue_model.package_rows[package_id][0]
+            index = self.queue_filter.mapFromSource(self.queue_model.index(position, 0))
+            if index.isValid():
+                self.queue_table.selectRow(index.row())
+                self.queue_table.scrollTo(index)
 
     def selected_action(self, action):
+        if package := self.selected_package():
+            self.c.pause_package(package.id, action == "pause")
+            return
         for job in self.selected_jobs():
             if action == "pause" and job.state in ("queued", "running", "repair"):
                 self.c.pause_job(job.id)
@@ -1225,11 +1454,18 @@ class Window(QMainWindow):
         self.refresh()
 
     def retry_selected_jobs(self):
-        if self.c.store.retry_failed([job.id for job in self.selected_jobs()]):
+        package = self.selected_package()
+        jobs = self.queue_model.package_jobs[package.id] if package else self.selected_jobs()
+        if self.c.store.retry_failed([job.id for job in jobs]):
             self.refresh()
 
+    def editable_jobs(self, jobs):
+        return [job for job in jobs if job.state in EDITABLE_STATES and job.id not in self.c.active]
+
     def edit_selected_jobs(self):
-        jobs = [job for job in self.selected_jobs() if job.state in EDITABLE_STATES and job.id not in self.c.active]
+        package = self.selected_package()
+        selected = self.queue_model.package_jobs[package.id] if package else self.selected_jobs()
+        jobs = self.editable_jobs(selected)
         if not jobs:
             return
         ids = {job.id for job in jobs}
@@ -1255,6 +1491,131 @@ class Window(QMainWindow):
         count = self.c.remove_jobs([job.id for job in self.selected_jobs()])
         if count:
             self.notify(f"Usunięto {count} zadań z kolejki.")
+
+    def context_index(self, view, point):
+        index = view.indexAt(point)
+        if index.isValid() and not view.selectionModel().isSelected(index):
+            view.selectRow(index.row())
+        return index
+
+    def queue_menu(self, point):
+        index = self.context_index(self.queue_table, point)
+        if not index.isValid():
+            return
+        item = self.queue_item(index)
+        menu = QMenu(self)
+        if isinstance(item, Package):
+            if self.selected_package() != item:
+                self.queue_table.selectRow(index.row())
+            self.build_package_menu(menu, item)
+        else:
+            jobs = self.selected_jobs()
+            records = [(job.entry.id, job.entry.title, job.path) for job in jobs if job.state == "done" and job.path]
+            self.add_file_actions(menu, records)
+            if records:
+                menu.addSeparator()
+            assignable = [job for job in jobs if job.state != "running" and job.id not in self.c.active]
+            if assignable:
+                grouping = menu.addMenu("Przenieś do pakietu")
+                grouping.addAction("Nowy pakiet…", lambda: self.assign_queue_package(assignable, create=True))
+                self.add_package_choices(grouping, self.c.store.packages().values(),
+                                         lambda key: self.assign_queue_package(assignable, key))
+                if any(job.package_id is not None for job in assignable):
+                    grouping.addAction("Bez pakietu", lambda: self.assign_queue_package(assignable))
+            for control in (self.pause_selected, self.resume_selected, self.edit_selected, self.retry_selected,
+                            self.move_first, self.move_up, self.move_down, self.move_last, self.remove_selected):
+                if control.isEnabled():
+                    menu.addAction(control.text(), control.click)
+        menu.exec(self.queue_table.viewport().mapToGlobal(point))
+        menu.deleteLater()
+
+    def build_package_menu(self, menu, package):
+        label = "Rozwiń pakiet" if package.id in self.queue_model.collapsed else "Zwiń pakiet"
+        menu.addAction(label, lambda: self.toggle_package(package.id))
+        for control in (self.pause_selected, self.resume_selected, self.move_first, self.move_up,
+                        self.move_down, self.move_last, self.edit_selected, self.retry_selected):
+            if control.isEnabled():
+                menu.addAction(control.text(), control.click)
+        jobs = self.queue_model.package_jobs[package.id]
+        if self.editable_jobs(jobs) and self.download_profiles:
+            profiles = menu.addMenu("Zastosuj profil do pakietu")
+            for name in sorted(self.download_profiles, key=str.casefold):
+                action = profiles.addAction(name.replace("&", "&&"))
+                action.triggered.connect(lambda checked=False, key=name: self.apply_package_profile(package.id, key))
+        records = [(job.entry.id, job.entry.title, job.path) for job in jobs if job.state == "done" and job.path]
+        if records:
+            menu.addSeparator()
+            self.add_file_actions(menu, records)
+
+    def assign_queue_package(self, jobs, package_id=None, *, create=False):
+        if create and not (name := self.package_name()):
+            return
+        ids = [job.id for job in jobs if job.id not in self.c.active]
+        if ids:
+            count = self.c.store.assign_package(ids, package_id, name=name if create else None)
+            if count:
+                self.notify(f"Zmieniono pakiet dla {count} zadań.")
+                self.refresh()
+
+    def apply_package_profile(self, package_id, name):
+        jobs = self.editable_jobs(self.queue_model.package_jobs.get(package_id, ()))
+        try:
+            count = self.c.store.edit_job_options(jobs, asdict(self.download_profiles[name]))
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        if count:
+            self.notify(f"Zastosowano profil do {count} zadań.")
+            self.refresh()
+
+    def add_file_actions(self, menu, records):
+        if len(records) == 1:
+            menu.addAction("Pokaż w Eksploratorze", lambda: self.reveal_downloads(records))
+        if records:
+            menu.addAction("Przenieś do folderu…", lambda: self.move_selected_downloads(records))
+
+    def history_selection(self):
+        return [(key, title, path) for index in self.history_table.selectionModel().selectedRows()
+                for title, key, _, path in (self.history.rows[index.row()],) if path]
+
+    def history_menu(self, point):
+        if not self.context_index(self.history_table, point).isValid():
+            return
+        records = self.history_selection()
+        if records:
+            menu = QMenu(self)
+            self.add_file_actions(menu, records)
+            menu.exec(self.history_table.viewport().mapToGlobal(point))
+            menu.deleteLater()
+
+    def reveal_downloads(self, records):
+        if len(records) != 1:
+            return
+        path = Path(records[0][2])
+        try:
+            if not path.is_absolute() or not path.is_file():
+                self.notify("Plik jest niedostępny.")
+                return
+            explorer = Path(os.environ.get("WINDIR", r"C:\Windows")) / "explorer.exe"
+            subprocess.Popen(f'"{explorer}" /select,"{path}"', executable=str(explorer))
+        except OSError:
+            self.notify("Nie udało się otworzyć Eksploratora.")
+
+    def move_selected_downloads(self, records):
+        if self.c.file_move is not None:
+            self.notify("Trwa już przenoszenie plików.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Folder docelowy", str(Path(records[0][2]).parent))
+        if not folder:
+            return
+        try:
+            groups = plan_selected(records, Path(folder))
+        except (OSError, ValueError):
+            LOG.exception("Plan przeniesienia zaznaczonych plików")
+            self.notify("Nie można odczytać wybranego folderu.")
+            return
+        if groups:
+            self.confirm_file_move(None, groups)
 
     def clear_queue(self):
         self.c.store.clear_jobs()
@@ -1406,15 +1767,23 @@ class Window(QMainWindow):
         self.engine_label.setText(f"yt-dlp {runtime.version} · {runtime.channel}" if runtime.ready
                                   else "Przygotowywanie zależności")
         selected = [job.id for job in self.selected_jobs()]
-        if self.queue_model.update_jobs(self.c.store.jobs()) and selected:
+        package = self.selected_package()
+        if self.queue_model.update_jobs(self.c.store.jobs(), self.c.store.packages()):
             selection = QItemSelection()
             for job_id in selected:
                 if job_id in self.queue_model.positions:
                     index = self.queue_filter.mapFromSource(self.queue_model.index(self.queue_model.positions[job_id], 0))
                     if index.isValid():
                         selection.select(index, index)
+            if package:
+                for position in self.queue_model.package_rows.get(package.id, ()):
+                    index = self.queue_filter.mapFromSource(self.queue_model.index(position, 0))
+                    if index.isValid():
+                        selection.select(index, index)
+                        break
             flags = QItemSelectionModel.SelectionFlag
-            self.queue_table.selectionModel().select(selection, flags.ClearAndSelect | flags.Rows)
+            if not selection.isEmpty():
+                self.queue_table.selectionModel().select(selection, flags.ClearAndSelect | flags.Rows)
         self.refresh_login_actions()
         self.pause_all.setText("Wznów kolejkę" if self.c.paused else "Wstrzymaj kolejkę")
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))
@@ -1422,8 +1791,7 @@ class Window(QMainWindow):
         self.update_summary()
         page = self.tabs.currentWidget()
         if page is self.history_tab:
-            self.history.replace([(r["title"] or "Z archiwum yt-dlp", r["id"], stamp(r["time"]), r["path"])
-                                  for r in self.c.store.history()])
+            self.refresh_history()
         elif page is self.updates_tab:
             self.updates.replace([(stamp(r["time"]), r["component"], r["version"], r["status"], r["detail"])
                                   for r in self.c.store.update_history()])
@@ -1434,6 +1802,22 @@ class Window(QMainWindow):
                                          else stamp(r["due"]) if r["due"] else "Wkrótce")
                                         for r in self.c.store.subscriptions()])
 
+    def refresh_history(self):
+        rows = [(r["title"] or "Z archiwum yt-dlp", r["id"], stamp(r["time"]), r["path"])
+                for r in self.c.store.history()]
+        if self.history.rows == rows:
+            return
+        model = self.history_table.selectionModel()
+        selected = {self.history.rows[index.row()][1] for index in model.selectedRows()}
+        self.history.replace(rows)
+        selection = QItemSelection()
+        for position, (_, video_id, _, _) in enumerate(rows):
+            if video_id in selected:
+                index = self.history.index(position, 0)
+                selection.select(index, index)
+        model.select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self.show_history_file.setEnabled(len(self.history_selection()) == 1)
+
     def on_progress(self, job_id, event):
         self.queue_model.update_progress(job_id, event)
         self.update_total_progress()
@@ -1441,9 +1825,12 @@ class Window(QMainWindow):
     def update_summary(self):
         jobs = self.queue_model.jobs
         counts = Counter(job.state for job in jobs)
+        headers = sum(self.queue_filter.mapFromSource(self.queue_model.index(position, 0)).isValid()
+                      for rows in self.queue_model.package_rows.values() for position in rows)
+        visible = self.queue_filter.rowCount() - headers
         self.summary.setText(f"Gotowe: {counts['done']}   ·   Pominięte: {counts['skipped']}"
                              f"   ·   Nieudane: {counts['failed']}   ·   Logowanie: {counts['auth']}"
-                             f"   ·   Widoczne: {self.queue_filter.rowCount()} z {len(jobs)}")
+                             f"   ·   Widoczne: {visible} z {len(jobs)}")
         self.finished_progress = 100 * sum(counts[state] for state in TERMINAL)
         self.update_total_progress()
 

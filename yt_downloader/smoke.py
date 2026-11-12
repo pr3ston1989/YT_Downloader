@@ -35,6 +35,9 @@ def prepare_queue(window):
     window.add_first.click()
     assert window.tabs.currentWidget() == window.queue_tab
     assert_saved_queue(window)
+    position = window.queue_model.package_rows[controller.store.jobs()[1].package_id][0]
+    window.queue_table.selectRow(position)
+    window.pause_selected.click()
 
 
 def assert_saved_queue(window):
@@ -42,12 +45,21 @@ def assert_saved_queue(window):
     actual = [(job.entry.id, job.state) for job in jobs]
     assert actual == [(URGENT, "queued"), (ARCHIVED, "skipped"), (NORMAL, "queued")], actual
     assert all(job.options == window.download_profiles[PROFILE] for job in jobs)
+    assert jobs[0].package_id is None
+    assert jobs[1].package_id == jobs[2].package_id
+    assert window.c.store.packages()[jobs[1].package_id].name == PLAYLIST_TITLE
 
 
 def interrupt_queue(window):
     assert window.c.paused, "The paused queue was not restored"
     assert_saved_queue(window)
     window.tabs.setCurrentWidget(window.queue_tab)
+    package_id = window.c.store.jobs()[1].package_id
+    assert controller.store.packages()[package_id].paused, "The playlist package pause was not restored"
+    position = window.queue_model.package_rows[package_id][0]
+    window.queue_table.selectRow(position)
+    window.resume_selected.click()
+    assert not controller.store.packages()[package_id].paused
     window.pause_all.click()
     folder = Path(window.download_profiles[PROFILE].folder) / URGENT_CHANNEL
     while True:

@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
@@ -10,7 +11,7 @@ import time
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .model import Entry, Source, parse_source
-from .organize import recover_file_moves
+from .organize import apply_plan, recover_file_moves
 from .process import Worker
 from .store import Job, Store
 from .updates import EngineManager
@@ -69,6 +70,8 @@ class Controller(QObject):
         self.manager = EngineManager(root / "engine", self.record)
         self.active = {}
         self.editing_jobs = set()
+        self.moving_videos = set()
+        self.file_move = None
         self.scan = None
         self.media_worker = None
         self.pending_repairs = {}
@@ -402,6 +405,53 @@ class Controller(QObject):
                     self.store.state(job_id, "queued")
         self.changed.emit()
 
+    def pause_package(self, package_id, paused):
+        self.store.pause_package(package_id, paused)
+        if paused:
+            for item in self.active.values():
+                if item.job.package_id == package_id and not item.stopped:
+                    item.stopped = True
+                    item.worker.stop()
+                    self.store.state(item.job.id, "queued")
+        self.changed.emit()
+
+    def move_downloads(self, root, groups):
+        if self.file_move is not None:
+            self.message.emit("Trwa już przenoszenie plików.")
+            return
+        active = {item.job.entry.id for item in self.active.values()}
+        self.moving_videos = {group.video_id for group in groups if not group.status}
+        result = self.file_move = Future()
+
+        def transfer():
+            try:
+                with closing(Store(self.root)) as store:
+                    counts = apply_plan(store, root, groups, active)
+                result.set_result(counts)
+            except Exception as exc:
+                result.set_exception(exc)
+
+        Thread(target=transfer, name="file-move").start()
+        self.message.emit("Przenoszenie pobranych plików…")
+
+    def poll_file_move(self):
+        if self.file_move is None or not self.file_move.done():
+            return
+        try:
+            moved, errors, busy = self.file_move.result()
+            message = f"Przeniesiono plików: {moved}."
+            if errors:
+                message += f" Grupy z błędem: {errors}. Szczegóły są w logu."
+            if busy:
+                message += f" Pliki pominięte podczas pobierania: {busy}."
+        except Exception:
+            LOG.exception("Przenoszenie pobranych plików")
+            message = "Nie udało się przenieść plików. Szczegóły są w logu."
+        self.file_move = None
+        self.moving_videos.clear()
+        self.message.emit(message)
+        self.changed.emit()
+
     def retry_auth(self):
         self.store.retry_auth()
         self.changed.emit()
@@ -423,11 +473,12 @@ class Controller(QObject):
 
     def step(self):
         self.poll_jobs()
+        self.poll_file_move()
         self.poll_scan()
         self.poll_media_inspection()
         self.poll_update()
         if self.install_pending:
-            if not (self.active or self.scan or self.editing_jobs or self.media_worker) and self.future is None:
+            if not (self.active or self.scan or self.editing_jobs or self.media_worker or self.file_move) and self.future is None:
                 candidate, self.install_pending = self.install_pending, None
                 self.update_ready.emit(candidate)
             if not self.scan or self.scan.worker:
@@ -450,7 +501,7 @@ class Controller(QObject):
             return
         changed = self.store.skip_downloaded(self.editing_jobs)
         while len(self.active) < self.prefs.parallel:
-            job = self.store.claim(self.editing_jobs)
+            job = self.store.claim(self.editing_jobs, self.moving_videos)
             if not job:
                 break
             try:
@@ -473,5 +524,10 @@ class Controller(QObject):
             self.scan.worker.close()
         for item in self.active.values():
             item.worker.close()
+        if self.file_move is not None:
+            try:
+                self.file_move.result()
+            except Exception:
+                LOG.exception("Zamykanie po błędzie przenoszenia plików")
         self.store.recover_interrupted()
         self.store.close()

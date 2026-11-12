@@ -63,13 +63,51 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([self.store.claim().id for _ in range(4)], [3, 4, 1, 2])
         self.assertIsNone(self.store.claim())
 
+    def test_package_order_pause_and_manual_job_pause_survive_restart(self):
+        entries = [replace(self.entry, id=f"v{i:010}") for i in range(1, 7)]
+        _, first = self.store.enqueue_batch(entries[:2], self.options, package_name="Playlista")
+        _, second = self.store.enqueue_batch(entries[2:4], self.options, package_name="Kanał")
+        self.store.enqueue(entries[4:5], self.options, package_id=first)
+        self.assertEqual([job.id for job in self.store.jobs()], [1, 2, 5, 3, 4])
+        self.store.move_package(second, "up")
+        self.assertEqual([job.id for job in self.store.jobs()], [3, 4, 1, 2, 5])
+        self.store.state(4, "paused")
+        self.store.pause_package(second, True)
+        self.store.enqueue(entries[5:], self.options, first=True)
+        with closing(Store(self.root)) as reopened:
+            self.assertTrue(reopened.packages()[second].paused)
+            self.assertEqual(reopened.claim().id, 6)
+            self.assertEqual(reopened.claim(moving={entries[0].id}).id, 2)
+            reopened.pause_package(second, False)
+            self.assertEqual(reopened.claim().id, 3)
+            self.assertEqual([job.state for job in reopened.jobs() if job.id == 4], ["paused"])
+
+    def test_repackaging_jobs_and_moving_a_split_package_to_an_edge(self):
+        entries = [replace(self.entry, id=f"v{i:010}") for i in range(1, 6)]
+        self.store.enqueue(entries, self.options)
+        self.assertEqual(self.store.assign_package([2, 5], None, name="Zestaw"), 2)
+        key = next(iter(self.store.packages()))
+        self.assertEqual([job.id for job in self.store.jobs()], [1, 2, 5, 3, 4])
+        self.store.move_jobs([5], "first")
+        self.store.move_package(key, "first")
+        self.assertEqual([job.id for job in self.store.jobs()], [5, 2, 1, 3, 4])
+        self.store.move_package(key, "last")
+        self.assertEqual([job.id for job in self.store.jobs()], [1, 3, 4, 5, 2])
+        self.store.assign_package([2], None)
+        self.store.remove_jobs([5])
+        self.assertEqual(self.store.packages(), {})
+
     def test_queue_position_migration_keeps_the_existing_insertion_order(self):
         root = self.root / "legacy-queue"
         with closing(Store(root)) as legacy:
             legacy.enqueue([replace(self.entry, id=f"v{i:010}") for i in range(1, 4)], self.options)
             legacy.db.execute("ALTER TABLE jobs DROP COLUMN queue_position")
+            legacy.db.execute("DROP INDEX job_package")
+            legacy.db.execute("ALTER TABLE jobs DROP COLUMN package_id")
+            legacy.db.execute("DROP TABLE packages")
         with closing(Store(root)) as migrated:
             self.assertEqual([job.id for job in migrated.jobs()], [1, 2, 3])
+            self.assertTrue(all(job.package_id is None for job in migrated.jobs()))
             migrated.move_jobs([3], "first")
             self.assertEqual(migrated.claim().id, 3)
 
