@@ -17,6 +17,8 @@ Długie playlisty i zakładki kanałów pojawiają się w podglądzie w miarę o
 
 Pole **Filtruj tytuły w podglądzie** ogranicza zaznaczanie i dodawanie do kolejki do widocznych wierszy. Po wyczyszczeniu filtra zobaczysz ponownie całą listę.
 
+W podglądzie podświetl wybrane wiersze za pomocą Ctrl lub Shift i kliknij **Wybierz zaznaczone**, aby wybrać je do pobrania. Pozostałe widoczne pozycje zostaną odznaczone. Następnie kliknij **Dodaj do kolejki**. Menu **Wybór…** oraz menu pod prawym przyciskiem pozwalają odznaczyć podświetlone wiersze albo zaznaczyć lub odznaczyć całą widoczną listę.
+
 W karcie **Zbieracz linków** możesz wkleić kilka adresów naraz. Każde źródło ma własny wynik odczytu, liczbę powtórzeń i opcje profilu oraz folderu. **Otwórz podgląd** pozwala przejrzeć i wybrać filmy z odczytanego źródła. Podgląd oznacza wpisy z kolejki i historii. Pozycje już oczekujące są domyślnie pomijane podczas ponownego dodawania. Aby pobrać ten sam materiał ponownie, np. w innym formacie, włącz **Pozwalaj na ponowne pobranie** w parametrach.
 
 Opcja **Pomijaj filmy tylko dla wspierających** jest domyślnie włączona. Aplikacja pomija je podczas odczytu listy, jeśli YouTube poda ich status, lub w kolejce, gdy dostęp zostanie sprawdzony dopiero podczas pobierania. Wyłączenie opcji pozwala próbować pobrać materiał z konta, które ma dostęp. Dla materiałów wymagających członkostwa przeglądarkę otwierasz ręcznie.

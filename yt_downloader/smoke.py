@@ -25,7 +25,11 @@ def prepare_queue(window):
     while controller.scan:
         yield
     assert [entry.id for entry in window.preview_model.entries] == [ARCHIVED, NORMAL], window.preview_info.text()
-    window.add_button.click()
+    for row in (0, 1):
+        window.preview_table.selectRow(row)
+        window.select_highlighted.click()
+        assert window.preview_model.selected == {row}, "Highlighted rows were not selected for download"
+        window.add_button.click()
 
     window.source.setText(f"https://www.youtube.com/watch?v={URGENT}")
     window.preview_button.click()

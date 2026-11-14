@@ -8,11 +8,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from PySide6.QtCore import QItemSelectionModel
+from PySide6.QtGui import QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QDialog
 
 from yt_downloader.controller import Controller
 from yt_downloader.model import Entry, Options, detect_episode_numbers, output_stem, parse_source
-from yt_downloader.ui import MediaDetailsDialog, OrganizeDialog, PreviewOptionsDialog, Window
+from yt_downloader.ui import MediaDetailsDialog, OrganizeDialog, PreviewOptionsDialog, Window, set_theme
 from yt_downloader.updates import EngineManager, Runtime
 from yt_downloader.worker import format_expression, inspect_media, load_engine, scan
 
@@ -191,6 +192,7 @@ class PaginationPreviewTests(unittest.TestCase):
         self.controller.manager.current = Runtime("engine", "deno", "ffmpeg")
         self.window = Window(self.app, self.controller)
         self.addCleanup(self.window.deleteLater)
+        self.addCleanup(self.window.history_timer.stop)
         workers = patch("yt_downloader.controller.Worker")
         self.worker = workers.start().return_value
         self.addCleanup(workers.stop)
@@ -263,6 +265,37 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertIn(0, self.window.preview_model.selected)
         self.assertNotIn(1, self.window.preview_model.selected)
 
+    def test_highlighted_preview_rows_can_be_chosen_and_enqueued_as_a_subset(self):
+        self.send_page(1, 7, {"kind": "done"})
+        self.assertEqual(self.window.preview_model.selected, set(range(6)))
+        self.assertFalse(self.window.select_highlighted.isEnabled())
+        model = self.window.preview_table.selectionModel()
+        flags = QItemSelectionModel.SelectionFlag
+        for row in (1, 4):
+            model.select(self.window.preview_filter.index(row, 2), flags.Select | flags.Rows)
+        self.assertTrue(self.window.select_highlighted.isEnabled())
+        self.window.select_highlighted.click()
+        self.assertEqual(self.window.preview_model.selected, {1, 4})
+        self.window.add_button.click()
+        self.assertEqual([job.entry.id for job in self.controller.store.jobs()], [entry(2).id, entry(5).id])
+
+    def test_highlighted_selection_uses_filtered_sorted_rows_and_preserves_hidden_checks(self):
+        self.send_page(1, 22, {"kind": "done"})
+        self.window.preview_order.setCurrentIndex(self.window.preview_order.findData("reverse"))
+        self.window.preview_search.setText("Film 2")
+        self.assertEqual(self.window.preview_filter.rowCount(), 3)
+        self.window.preview_table.selectRow(1)
+        self.window.select_highlighted.click()
+        self.assertTrue(19 in self.window.preview_model.selected)
+        self.assertFalse(1 in self.window.preview_model.selected)
+        self.assertFalse(20 in self.window.preview_model.selected)
+        self.assertTrue(0 in self.window.preview_model.selected)
+        self.window.unselect_highlighted.trigger()
+        self.assertFalse(19 in self.window.preview_model.selected)
+        self.window.select_highlighted.click()
+        self.window.add_button.click()
+        self.assertEqual([job.entry.id for job in self.controller.store.jobs()], [entry(20).id])
+
     def test_preview_can_add_a_visible_selection_to_the_front_of_the_queue(self):
         store = self.controller.store
         store.enqueue([entry(i) for i in range(100, 200)], self.controller.prefs.options)
@@ -285,6 +318,31 @@ class PaginationPreviewTests(unittest.TestCase):
         self.assertFalse(self.window.move_first.isEnabled())
         self.window.move_down.click()
         self.assertEqual([job.id for job in store.jobs()], [1, 4, 2, 3])
+
+    def test_queue_icons_follow_theme_changes_and_dim_disabled_controls(self):
+        self.addCleanup(self.app.setPalette, QPalette(self.app.palette()))
+        self.addCleanup(self.app.setStyleSheet, self.app.styleSheet())
+        toolbar = (self.window.pause_all, self.window.pause_selected, self.window.resume_selected,
+                   self.window.move_first, self.window.move_up, self.window.move_down, self.window.move_last)
+
+        def glyph_color(control, mode):
+            pixels = control.icon().pixmap(control.iconSize(), 1.5, mode).toImage()
+            return max((pixels.pixelColor(x, y) for y in range(pixels.height()) for x in range(pixels.width())),
+                       key=lambda color: color.alpha())
+
+        for theme, expected in (("dark", "#edf3fa"), ("light", "#182840")):
+            set_theme(self.app, theme)
+            self.app.processEvents()
+            for control in toolbar:
+                with self.subTest(theme=theme, control=control.accessibleName()):
+                    active = glyph_color(control, QIcon.Mode.Normal)
+                    disabled = glyph_color(control, QIcon.Mode.Disabled)
+                    self.assertEqual(active.name(), expected)
+                    self.assertGreaterEqual(active.alpha(), 240)
+                    self.assertGreater(disabled.alpha(), 0)
+                    self.assertLess(disabled.alpha(), active.alpha() / 2)
+            self.window.pause_all.click()
+            self.assertEqual(glyph_color(self.window.pause_all, QIcon.Mode.Normal).name(), expected)
 
     def test_collector_reads_links_and_applies_folder_per_source_without_rescanning(self):
         self.send_page(1, 1, {"kind": "done"})

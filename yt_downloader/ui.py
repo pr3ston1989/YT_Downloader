@@ -14,10 +14,10 @@ from threading import Thread
 import winreg
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QItemSelection, QItemSelectionModel, QLockFile, QMimeData, QModelIndex, QSortFilterProxyModel,
-    Qt, QTimer, QUrl, Signal,
+    QAbstractTableModel, QEvent, QItemSelection, QItemSelectionModel, QLockFile, QMimeData, QModelIndex, QRectF, QSize,
+    QSortFilterProxyModel, Qt, QTimer, QUrl, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QIcon, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -67,6 +67,49 @@ def button(title, action, *, primary=False):
     if primary:
         widget.setProperty("primary", True)
     return widget
+
+
+class QueueIconButton(QPushButton):
+    def __init__(self, name, symbol, action):
+        super().__init__()
+        self.symbol = None
+        self.setIconSize(QSize(18, 18))
+        self.setAccessibleName(name)
+        self.setToolTip(name)
+        self.clicked.connect(action)
+        self.set_symbol(symbol)
+
+    def set_symbol(self, symbol):
+        if self.symbol != symbol:
+            self.symbol = symbol
+            self.update_icon()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            self.update_icon()
+
+    def update_icon(self):
+        if getattr(self, "symbol", None) is None:
+            return
+        foreground = self.palette().color(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText)
+        disabled = QColor(foreground)
+        disabled.setAlphaF(0.38)
+        source = self.style().standardIcon(self.symbol)
+        icon = QIcon()
+        for scale in (1.0, 1.5, 2.0, 3.0):
+            glyph = source.pixmap(self.iconSize(), scale)
+            size = glyph.deviceIndependentSize()
+            bounds = QRectF(0, 0, size.width(), size.height())
+            for mode, color in ((QIcon.Mode.Normal, foreground), (QIcon.Mode.Disabled, disabled)):
+                pixmap = QPixmap(glyph)
+                with QPainter(pixmap) as painter:
+                    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+                    painter.fillRect(bounds, color)
+                icon.addPixmap(pixmap, mode)
+                if mode == QIcon.Mode.Normal:
+                    icon.addPixmap(pixmap, QIcon.Mode.Active)
+        self.setIcon(icon)
 
 
 def combo(items, selected):
@@ -932,19 +975,35 @@ class Window(QMainWindow):
         self.preview_filter.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.preview_filter.setSortRole(USER)
         self.preview_table = table(self.preview_filter, 2)
+        self.preview_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.preview_table.setColumnWidth(0, 72)
         self.preview_table.setColumnWidth(1, 44)
         self.preview_table.setColumnWidth(4, 64)
         self.preview_table.setColumnWidth(6, 122)
         self.preview_info = QLabel("Wklej link, aby odczytać listę.")
         self.preview_info.setWordWrap(True)
-        self.select_all_button = button("Zaznacz wszystkie", lambda: self.select_visible(True))
-        self.select_none_button = button("Odznacz wszystkie", lambda: self.select_visible(False))
+        self.select_highlighted = button("Wybierz zaznaczone", self.choose_highlighted)
+        self.select_highlighted.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.select_highlighted.setToolTip(
+            "Wybierz do pobrania podświetlone wiersze. Pozostałe widoczne pozycje zostaną odznaczone."
+            "\nCtrl dodaje pojedyncze wiersze, a Shift zaznacza zakres.")
+        selection_button = QPushButton("Wybór…")
+        self.preview_selection_menu = QMenu(selection_button)
+        self.unselect_highlighted = self.preview_selection_menu.addAction(
+            "Odznacz zaznaczone", lambda: self.check_highlighted(False))
+        self.preview_selection_menu.addSeparator()
+        self.select_all_button = self.preview_selection_menu.addAction(
+            "Zaznacz wszystkie", lambda: self.select_visible(True))
+        self.select_none_button = self.preview_selection_menu.addAction(
+            "Odznacz wszystkie", lambda: self.select_visible(False))
+        selection_button.setMenu(self.preview_selection_menu)
+        self.preview_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.preview_table.customContextMenuRequested.connect(self.preview_selection_context_menu)
         self.add_button = button("Dodaj do kolejki", self.enqueue, primary=True)
         self.add_button.setToolTip("Dodaj zaznaczone pozycje widoczne w podglądzie.")
         self.add_first = button("Pobierz następne", lambda: self.enqueue(first=True))
         self.add_first.setToolTip("Dodaj zaznaczone widoczne pozycje na początek kolejki. Ruszą w pierwszym wolnym miejscu.")
-        self.organize_button = button("Uporządkuj pliki…", self.organize_downloads)
+        self.organize_button = button("Uporządkuj…", self.organize_downloads)
         self.organize_button.setToolTip("Dopasuj istniejące pliki do pozycji z playlisty i zobacz plan przeniesienia.")
         self.preview_search = QLineEdit()
         self.preview_search.setPlaceholderText("Filtruj tytuły w podglądzie")
@@ -967,6 +1026,7 @@ class Window(QMainWindow):
         self.preview_parameters.setEnabled(False)
         self.preview_mode.setEnabled(False)
         self.preview_model.dataChanged.connect(lambda *_: self.refresh_preview_actions())
+        self.preview_table.selectionModel().selectionChanged.connect(lambda *_: self.refresh_preview_actions())
         self.preview_table.selectionModel().currentChanged.connect(lambda *_: self.refresh_preview_actions())
         self.set_preview_selectable(False)
         filter_row = row(self.preview_search, self.preview_order, self.preview_mode, self.preview_parameters,
@@ -974,7 +1034,7 @@ class Window(QMainWindow):
         filter_row.layout().setStretch(0, 1)
         layout.addWidget(filter_row)
         layout.addWidget(self.preview_info)
-        layout.addWidget(row(self.select_all_button, self.select_none_button, self.organize_button, None,
+        layout.addWidget(row(self.select_highlighted, selection_button, self.organize_button, None,
                              self.package_button, self.add_first, self.add_button))
         layout.addWidget(self.preview_table, 1)
         return page
@@ -1000,18 +1060,18 @@ class Window(QMainWindow):
         self.queue_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.queue_table.customContextMenuRequested.connect(self.queue_menu)
         icons = QStyle.StandardPixmap
-        self.pause_all = self.queue_icon("Wstrzymaj kolejkę", icons.SP_MediaPause,
-                                        lambda: self.c.pause_all(not self.c.paused))
+        self.pause_all = QueueIconButton("Wstrzymaj kolejkę", icons.SP_MediaPause,
+                                         lambda: self.c.pause_all(not self.c.paused))
         self.finish_current = button("Wstrzymaj po bieżących", lambda: self.c.pause_all(True, finish_current=True))
         self.finish_current.setToolTip("Dokończ rozpoczęte pobrania i poczekaj na ręczne wznowienie kolejki.")
-        self.pause_selected = self.queue_icon("Wstrzymaj zaznaczone", icons.SP_MediaPause,
+        self.pause_selected = QueueIconButton("Wstrzymaj zaznaczone", icons.SP_MediaPause,
                                               lambda: self.selected_action("pause"))
-        self.resume_selected = self.queue_icon("Wznów zaznaczone", icons.SP_MediaPlay,
+        self.resume_selected = QueueIconButton("Wznów zaznaczone", icons.SP_MediaPlay,
                                                lambda: self.selected_action("resume"))
-        self.move_first = self.queue_icon("Na początek", icons.SP_MediaSkipBackward, lambda: self.move_queue("first"))
-        self.move_up = self.queue_icon("Wyżej", icons.SP_ArrowUp, lambda: self.move_queue("up"))
-        self.move_down = self.queue_icon("Niżej", icons.SP_ArrowDown, lambda: self.move_queue("down"))
-        self.move_last = self.queue_icon("Na koniec", icons.SP_MediaSkipForward, lambda: self.move_queue("last"))
+        self.move_first = QueueIconButton("Na początek", icons.SP_MediaSkipBackward, lambda: self.move_queue("first"))
+        self.move_up = QueueIconButton("Wyżej", icons.SP_ArrowUp, lambda: self.move_queue("up"))
+        self.move_down = QueueIconButton("Niżej", icons.SP_ArrowDown, lambda: self.move_queue("down"))
+        self.move_last = QueueIconButton("Na koniec", icons.SP_MediaSkipForward, lambda: self.move_queue("last"))
         self.remove_selected = button("Usuń z kolejki", self.remove_selected_jobs)
         self.remove_selected.setToolTip("Usuń zaznaczone zadania. Aktywne pobrania zostaną zatrzymane, a pliki pozostaną na dysku.")
         self.edit_selected = button("Parametry…", self.edit_selected_jobs)
@@ -1055,13 +1115,6 @@ class Window(QMainWindow):
         next_timer.timeout.connect(lambda: self.update_next_download() if page.isVisible() else None)
         next_timer.start()
         return page
-
-    def queue_icon(self, name, icon, action):
-        control = button("", action)
-        control.setIcon(self.style().standardIcon(icon))
-        control.setAccessibleName(name)
-        control.setToolTip(name)
-        return control
 
     def settings_page(self):
         settings = self.c.prefs
@@ -1283,6 +1336,9 @@ class Window(QMainWindow):
         enabled = self.preview_model.checkable and self.preview_filter.rowCount() > 0
         self.select_all_button.setEnabled(enabled)
         self.select_none_button.setEnabled(enabled)
+        highlighted = enabled and self.preview_table.selectionModel().hasSelection()
+        self.select_highlighted.setEnabled(highlighted)
+        self.unselect_highlighted.setEnabled(highlighted)
         selected = self.preview_model.selected
         can_add = enabled and bool(selected) and (not self.preview_search.text().strip() or any(
             self.preview_filter.mapToSource(self.preview_filter.index(row, 0)).row() in selected
@@ -1382,7 +1438,34 @@ class Window(QMainWindow):
                 for row in range(self.preview_filter.rowCount())]
 
     def select_visible(self, selected):
-        self.preview_model.select_rows(self.visible_rows(), selected)
+        if self.preview_model.checkable:
+            self.preview_model.select_rows(self.visible_rows(), selected)
+
+    def highlighted_preview_rows(self):
+        return [self.preview_filter.mapToSource(index).row()
+                for index in self.preview_table.selectionModel().selectedRows()]
+
+    def choose_highlighted(self):
+        rows = self.highlighted_preview_rows()
+        if self.preview_model.checkable and rows:
+            self.preview_model.select_rows(self.visible_rows(), False)
+            self.preview_model.select_rows(rows, True)
+
+    def check_highlighted(self, checked):
+        if self.preview_model.checkable:
+            self.preview_model.select_rows(self.highlighted_preview_rows(), checked)
+
+    def preview_selection_context_menu(self, point):
+        if self.context_index(self.preview_table, point).isValid():
+            menu = QMenu(self)
+            choose = menu.addAction(self.select_highlighted.text(), self.choose_highlighted)
+            choose.setEnabled(self.select_highlighted.isEnabled())
+            menu.addAction(self.unselect_highlighted)
+            menu.addSeparator()
+            menu.addAction(self.select_all_button)
+            menu.addAction(self.select_none_button)
+            menu.exec(self.preview_table.viewport().mapToGlobal(point))
+            menu.deleteLater()
 
     def on_scan_entries(self, offset, entries):
         if offset == 0 and self.preview_model.entries:
@@ -2078,7 +2161,7 @@ class Window(QMainWindow):
         self.pause_all.setAccessibleName(label)
         self.pause_all.setToolTip(label)
         icon = QStyle.StandardPixmap.SP_MediaPlay if self.c.paused else QStyle.StandardPixmap.SP_MediaPause
-        self.pause_all.setIcon(self.style().standardIcon(icon))
+        self.pause_all.set_symbol(icon)
         self.finish_current.setEnabled(not self.c.paused and bool(self.c.active))
         self.retry_failed.setEnabled(any(job.state == "failed" for job in self.queue_model.jobs))
         self.selection_state()
